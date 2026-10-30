@@ -3,6 +3,17 @@ pub(crate) use crate::faults::Faults;
 pub use crate::faults::{CancellationCode, FaultConfig, FaultConfigError, FaultEffect, FaultRule};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+
+impl CancellationCode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::ConditionalCheckFailed => "ConditionalCheckFailed",
+            Self::TransactionConflict => "TransactionConflict",
+        }
+    }
+}
+
 pub(crate) enum Effect {
     Error(Error),
     BatchDeferral(BTreeMap<String, BTreeSet<usize>>),
@@ -60,4 +71,62 @@ fn has_table(request: &Value, table: &str) -> bool {
                 })
             })
         })
+}
+
+pub(crate) fn validate_rule(rule: &FaultRule) -> Result<(), &'static str> {
+    if rule.bucket.is_some() || rule.key.is_some() {
+        return Err("DynamoDB rules cannot select bucket or key");
+    }
+    if !matches!(
+        rule.operation.as_str(),
+        "CreateTable"
+            | "DescribeTable"
+            | "DeleteTable"
+            | "GetItem"
+            | "PutItem"
+            | "UpdateItem"
+            | "DeleteItem"
+            | "Query"
+            | "Scan"
+            | "TransactWriteItems"
+            | "TransactGetItems"
+            | "BatchGetItem"
+            | "BatchWriteItem"
+    ) {
+        return Err("unsupported operation");
+    }
+    if rule.table.as_ref().is_some_and(|table| table.is_empty()) {
+        return Err("table must not be empty");
+    }
+    match &rule.effect {
+        FaultEffect::TransactionCanceled { reasons } => {
+            if rule.operation != "TransactWriteItems" {
+                return Err("transaction cancellation requires TransactWriteItems");
+            }
+            if reasons.is_empty()
+                || reasons.len() > 100
+                || reasons.iter().all(|code| *code == CancellationCode::None)
+            {
+                return Err("reasons must contain 1..100 entries and a failure");
+            }
+        }
+        FaultEffect::BatchDeferral { positions } => {
+            let max = match rule.operation.as_str() {
+                "BatchGetItem" => 100,
+                "BatchWriteItem" => 25,
+                _ => return Err("batch deferral requires a batch operation"),
+            };
+            if positions.is_empty()
+                || positions.iter().any(|(table, positions)| {
+                    table.is_empty()
+                        || positions.is_empty()
+                        || positions.iter().any(|position| *position >= max)
+                })
+            {
+                return Err("batch positions must name tables and valid positions");
+            }
+        }
+        FaultEffect::Throttle | FaultEffect::InternalServerError => {}
+    }
+    Ok(())
 }

@@ -101,8 +101,9 @@ configuration seam is required when wildcard localhost resolves locally.
 
 S3 supports single byte ranges (closed, open-ended, suffix), content type, user
 metadata, up to ten upload tags, and declared `aws:kms` encryption attributes.
-KMS attributes are stored and echoed; no encryption or KMS calls occur. Tag counts
-are returned on GET/HEAD; the separate object-tagging APIs are excluded.
+KMS attributes are stored and echoed; no encryption or KMS calls occur. S3 stores
+tags and exposes the count on GET/HEAD (`x-amz-tagging-count` for nonempty sets);
+the separate object-tagging APIs are excluded.
 SHA256 and CRC32 upload checksums (including SDK streaming trailers) and Content-MD5
 are validated before publication. Checksum-enabled full reads return the stored
 checksum. ETags are quoted MD5 digests, including simulated SSE objects.
@@ -117,6 +118,35 @@ are **not authenticated**. GET supports `response-content-disposition`.
 Multipart uploads, ACLs, versioning, conditional requests, delimiter/start-after
 listing, and other unimplemented options return explicit S3 errors. S3 errors use
 REST/XML; HEAD error responses have no body.
+
+Objects have a 64 MiB decoded size limit. The separate 65 MiB wire body limit
+allows up to 1 MiB of AWS chunk framing/trailers for maximum-size objects.
+Overflow returns `EntityTooLarge` and preserves any existing object. DynamoDB's
+independent JSON body limit remains 32 MiB.
+
+Routing inspects the authority/Host, method, raw path/query and target before body
+collection. Precedence is any `X-Amz-Target`, then explicit SigV4 service scope,
+then `<bucket>.localhost`, then non-root path-style S3. Unknown DynamoDB targets
+stay JSON errors; unsupported signing services cannot fall through to S3.
+Conflicting/malformed explicit signing scopes fail before execution.
+
+Future services reserve the following spaces on the shared base host. These
+reservations are documentation only; current non-root paths still reach S3:
+
+- SSM: `POST /` with target `AmazonSSM.<operation>`, at target precedence.
+- Lambda: all methods on raw `/2015-03-31/functions` and its `/...` descendants,
+  including `POST /2015-03-31/functions/{function}/invocations`.
+- Plain HTTP stubs: explicitly configured exact method/raw-path pairs only,
+  such as `GET /certificates/synthetic.pem`.
+
+When activated, future AWS scopes select their service. After target/scope/bucket
+host selection, Lambda paths precede configured HTTP pairs, which precede the
+path-style S3 fallback. Unsupported operations stay with their owning service.
+Raw reserved paths are matched without decoding or normalization. These future
+paths can collide with base-host path-style bucket/key requests; use bucket-host
+addressing or explicit S3 signing for such keys. Bucket hosts retain S3 object
+paths, including service-looking paths, subject to target/scope precedence.
+No future service or stub handlers are implemented.
 
 To exercise a running server with synthetic data and dummy credentials:
 

@@ -139,6 +139,93 @@ impl Emulator {
 }
 
 #[tokio::test]
+async fn s3_size_policy_preserves_binary_sdk_uploads_and_rejects_oversized_overwrites() {
+    let e = Emulator::new().await;
+    // Above DynamoDB's JSON body cap, with invalid UTF-8 and zero bytes.
+    let mut binary = vec![0xff; 33 * 1024 * 1024];
+    binary[..4].copy_from_slice(&[0, 0x80, 0xfe, 0xff]);
+    success(
+        e.client
+            .put_object()
+            .bucket(BUCKET)
+            .key("large")
+            .metadata("fixture", "binary")
+            .body(ByteStream::from(binary.clone()))
+            .send()
+            .await,
+    );
+    let get = success(
+        e.client
+            .get_object()
+            .bucket(BUCKET)
+            .key("large")
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await,
+    );
+    assert!(get.checksum_crc32().is_some());
+    assert_eq!(
+        success(get.body.collect().await).into_bytes().as_ref(),
+        binary
+    );
+    drop(binary);
+
+    // The documented object boundary is independent of the wire framing budget.
+    let maximum = vec![0x80; 64 * 1024 * 1024];
+    let mut framed = b"4000000\r\n".to_vec();
+    framed.extend_from_slice(&maximum);
+    framed.extend_from_slice(b"\r\n0\r\n\r\n");
+    let response = success(
+        e.http
+            .put(e.url("boundary"))
+            .header("content-encoding", "aws-chunked")
+            .header("x-amz-decoded-content-length", "67108864")
+            .body(framed)
+            .send()
+            .await,
+    );
+    assert_eq!(response.status(), 200);
+    assert_eq!(e.bytes("boundary").await, maximum);
+    drop(maximum);
+    for excessive_framing in [false, true] {
+        let mut request = e.http.put(e.url("large"));
+        let payload = if excessive_framing {
+            // A tiny decoded object with wire framing over budget isolates the wire cap.
+            let mut wire = b"1;padding=".to_vec();
+            wire.resize(65 * 1024 * 1024, b'a');
+            wire.extend_from_slice(b"\r\nx\r\n0\r\n\r\n");
+            request = request
+                .header("content-encoding", "aws-chunked")
+                .header("x-amz-decoded-content-length", "1");
+            wire
+        } else {
+            vec![0; 64 * 1024 * 1024 + 1]
+        };
+        let response = success(request.body(payload).send().await);
+        assert_eq!(response.status(), 400);
+        assert!(success(response.text().await).contains("<Code>EntityTooLarge</Code>"));
+        let head = success(
+            e.client
+                .head_object()
+                .bucket(BUCKET)
+                .key("large")
+                .send()
+                .await,
+        );
+        assert_eq!(head.content_length(), Some(33 * 1024 * 1024));
+        assert_eq!(
+            head.metadata()
+                .and_then(|m| m.get("fixture"))
+                .map(String::as_str),
+            Some("binary")
+        );
+        let stored = e.bytes("large").await;
+        assert_eq!(&stored[..4], &[0, 0x80, 0xfe, 0xff]);
+        assert!(stored[4..].iter().all(|byte| *byte == 0xff));
+    }
+}
+
+#[tokio::test]
 async fn sdk_object_lifecycle_default_crc32_and_modeled_errors() {
     let e = Emulator::new().await;
     let c = &e.client;

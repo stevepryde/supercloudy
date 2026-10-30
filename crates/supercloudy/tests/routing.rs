@@ -1,7 +1,10 @@
 use reqwest::{Client, StatusCode};
 use serde_json::json;
 use supercloudy::server::{Config, router_with_config};
-use tokio::net::TcpListener;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
 
 struct Emulator {
     endpoint: String,
@@ -29,6 +32,37 @@ fn auth(service: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 Credential=test/20261031/us-east-1/{service}/aws4_request, SignedHeaders=host, Signature=test"
     )
+}
+
+#[tokio::test]
+async fn unknown_targets_respond_before_body_arrives_despite_s3_hints() {
+    let e = emulator(json!({"rules":[]})).await;
+    for target in ["DynamoDB_20120810.NotAnOperation", "AmazonSSM.GetParameter"] {
+        let mut stream = TcpStream::connect(e.endpoint.strip_prefix("http://").unwrap())
+            .await
+            .unwrap();
+        // Keep the connection open and deliberately withhold every body byte.
+        let headers = format!(
+            "POST / HTTP/1.1\r\nHost: synthetic-bucket.localhost\r\nX-Amz-Target: {target}\r\nAuthorization: {}\r\nContent-Length: 100\r\n\r\n",
+            auth("s3")
+        );
+        stream.write_all(headers.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !response
+                .windows(b"com.amazon.coral.service#UnknownOperationException".len())
+                .any(|w| w == b"com.amazon.coral.service#UnknownOperationException")
+            {
+                let mut buffer = [0; 1024];
+                let count = stream.read(&mut buffer).await.unwrap();
+                assert_ne!(count, 0, "connection closed without protocol error");
+                response.extend_from_slice(&buffer[..count]);
+            }
+        })
+        .await
+        .expect("routing waited for an unread request body");
+        assert!(response.starts_with(b"HTTP/1.1 400 "));
+    }
 }
 
 #[tokio::test]
@@ -203,6 +237,12 @@ fn service_specific_fault_selectors_are_rejected_at_construction() {
         json!({"service":"s3","operation":"PutObject","table":"table","effect":{"type":"throttle"}}),
         json!({"operation":"PutItem","bucket":"synthetic-bucket","effect":{"type":"throttle"}}),
         json!({"service":"s3","operation":"PutObject","effect":{"type":"batch_deferral","positions":{"table":[0]}}}),
+        json!({"service":"s3","operation":"PutObject","effect":{"type":"transaction_canceled","reasons":["TransactionConflict"]}}),
+        json!({"service":"s3","operation":"CreateTable","effect":{"type":"throttle"}}),
+        json!({"service":"s3","operation":"PutObject","bucket":"","effect":{"type":"throttle"}}),
+        json!({"service":"s3","operation":"PutObject","key":"","effect":{"type":"throttle"}}),
+        json!({"operation":"GetObject","effect":{"type":"throttle"}}),
+        json!({"operation":"GetItem","table":"","effect":{"type":"throttle"}}),
         json!({"service":"lambda","operation":"PutObject","effect":{"type":"throttle"}}),
     ] {
         let mut rule = rule;
@@ -218,4 +258,80 @@ fn service_specific_fault_selectors_are_rejected_at_construction() {
         })
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn service_fault_adapters_preserve_selectors_commits_and_identical_instance_counters() {
+    let config = json!({"rules":[
+        {"service":"s3","operation":"CreateBucket","bucket":"synthetic-new","first_request":1,"repeat":1,"effect":{"type":"internal_server_error"}},
+        {"service":"s3","operation":"DeleteObject","bucket":"synthetic-bucket","key":"selected","first_request":1,"repeat":1,"effect":{"type":"throttle"}},
+        {"service":"s3","operation":"PutObject","bucket":"synthetic-bucket","key":"selected","first_request":2,"repeat":1,"effect":{"type":"internal_server_error"}}
+    ]});
+    let first = emulator(config.clone()).await;
+    let second = emulator(config).await;
+    let c = Client::new();
+    // Exhaust the first instance's rules before repeating the same scenario on the second.
+    for e in [&first, &second] {
+        let bucket = format!("{}/synthetic-new", e.endpoint);
+        assert_eq!(c.put(&bucket).send().await.unwrap().status(), 500);
+        assert_eq!(
+            c.get(format!("{bucket}?list-type=2"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+        assert_eq!(c.put(&bucket).send().await.unwrap().status(), 200);
+        for path in ["synthetic-bucket/other-key", "dotted.bucket/selected"] {
+            assert_eq!(
+                c.put(format!("{}/{path}", e.endpoint))
+                    .body("unmatched")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                200
+            );
+        }
+        let object = format!("{}/synthetic-bucket/selected", e.endpoint);
+        assert_eq!(
+            c.put(&object)
+                .body("original")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(
+            c.put(&object)
+                .body("rejected")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            500
+        );
+        assert_eq!(
+            c.get(&object).send().await.unwrap().text().await.unwrap(),
+            "original"
+        );
+        assert_eq!(c.delete(&object).send().await.unwrap().status(), 503);
+        assert_eq!(
+            c.get(&object).send().await.unwrap().text().await.unwrap(),
+            "original"
+        );
+        assert_eq!(c.delete(&object).send().await.unwrap().status(), 204);
+        assert_eq!(c.get(&object).send().await.unwrap().status(), 404);
+        assert_eq!(
+            c.put(&object)
+                .body("accepted")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+    }
 }

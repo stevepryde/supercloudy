@@ -16,7 +16,7 @@ fn default_service() -> String {
     "dynamodb".into()
 }
 
-/// Ordinals start at one and count valid requests matching the operation and table.
+/// Ordinals start at one and count validated requests matching service selectors.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FaultRule {
@@ -52,16 +52,6 @@ pub enum CancellationCode {
     ConditionalCheckFailed,
     TransactionConflict,
 }
-impl CancellationCode {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "None",
-            Self::ConditionalCheckFailed => "ConditionalCheckFailed",
-            Self::TransactionConflict => "TransactionConflict",
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct FaultConfigError(String);
 impl fmt::Display for FaultConfigError {
@@ -77,102 +67,16 @@ impl FaultConfig {
             let invalid =
                 |message: &str| FaultConfigError(format!("fault rule {}: {message}", index + 1));
             match rule.service.as_str() {
-                "dynamodb" => {
-                    if rule.bucket.is_some() || rule.key.is_some() {
-                        return Err(invalid("DynamoDB rules cannot select bucket or key"));
-                    }
-                    if !matches!(
-                        rule.operation.as_str(),
-                        "CreateTable"
-                            | "DescribeTable"
-                            | "DeleteTable"
-                            | "GetItem"
-                            | "PutItem"
-                            | "UpdateItem"
-                            | "DeleteItem"
-                            | "Query"
-                            | "Scan"
-                            | "TransactWriteItems"
-                            | "TransactGetItems"
-                            | "BatchGetItem"
-                            | "BatchWriteItem"
-                    ) {
-                        return Err(invalid("unsupported operation"));
-                    }
-                }
-                "s3" => {
-                    if rule.table.is_some()
-                        || !matches!(
-                            rule.effect,
-                            FaultEffect::Throttle | FaultEffect::InternalServerError
-                        )
-                    {
-                        return Err(invalid(
-                            "S3 rules support bucket/key selectors and throttle/internal errors only",
-                        ));
-                    }
-                    if !matches!(
-                        rule.operation.as_str(),
-                        "CreateBucket"
-                            | "PutObject"
-                            | "GetObject"
-                            | "HeadObject"
-                            | "CopyObject"
-                            | "DeleteObject"
-                            | "ListObjectsV2"
-                    ) {
-                        return Err(invalid("unsupported S3 operation"));
-                    }
-                    if rule.bucket.as_ref().is_some_and(|v| v.is_empty())
-                        || rule.key.as_ref().is_some_and(|v| v.is_empty())
-                    {
-                        return Err(invalid("bucket and key selectors must not be empty"));
-                    }
-                }
-                _ => return Err(invalid("unsupported service")),
+                "dynamodb" => crate::dynamodb::faults::validate_rule(rule),
+                "s3" => crate::s3::faults::validate_rule(rule),
+                _ => Err("unsupported service"),
             }
-            if rule.table.as_ref().is_some_and(|table| table.is_empty()) {
-                return Err(invalid("table must not be empty"));
-            }
+            .map_err(invalid)?;
             if rule.first_request == 0 || rule.repeat == 0 {
                 return Err(invalid("first_request and repeat must be positive"));
             }
             if rule.first_request.checked_add(rule.repeat - 1).is_none() {
                 return Err(invalid("request ordinal range overflows"));
-            }
-            match &rule.effect {
-                FaultEffect::TransactionCanceled { reasons } => {
-                    if rule.operation != "TransactWriteItems" {
-                        return Err(invalid(
-                            "transaction cancellation requires TransactWriteItems",
-                        ));
-                    }
-                    if reasons.is_empty()
-                        || reasons.len() > 100
-                        || reasons.iter().all(|code| *code == CancellationCode::None)
-                    {
-                        return Err(invalid("reasons must contain 1..100 entries and a failure"));
-                    }
-                }
-                FaultEffect::BatchDeferral { positions } => {
-                    let max = match rule.operation.as_str() {
-                        "BatchGetItem" => 100,
-                        "BatchWriteItem" => 25,
-                        _ => return Err(invalid("batch deferral requires a batch operation")),
-                    };
-                    if positions.is_empty()
-                        || positions.iter().any(|(table, positions)| {
-                            table.is_empty()
-                                || positions.is_empty()
-                                || positions.iter().any(|position| *position >= max)
-                        })
-                    {
-                        return Err(invalid(
-                            "batch positions must name tables and valid positions",
-                        ));
-                    }
-                }
-                FaultEffect::Throttle | FaultEffect::InternalServerError => {}
             }
         }
         Ok(())
@@ -221,20 +125,5 @@ impl Faults {
             }
         }
         selected
-    }
-    pub(crate) fn s3_effect(
-        &self,
-        operation: &str,
-        bucket: &str,
-        key: Option<&str>,
-    ) -> Option<&'static str> {
-        self.select("s3", operation, |rule| {
-            rule.bucket.as_deref().is_none_or(|b| b == bucket)
-                && rule.key.as_deref().is_none_or(|k| Some(k) == key)
-        })
-        .map(|effect| match effect {
-            FaultEffect::Throttle => "SlowDown",
-            _ => "InternalError",
-        })
     }
 }

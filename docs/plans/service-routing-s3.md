@@ -27,7 +27,7 @@ Keep modules concrete:
 | `s3` | Operation selection, validation, storage, execution |
 | `s3/http` | URI/header decoding, bounded body and aws-chunked decoding |
 | `s3/protocol` | S3 XML and HTTP responses |
-| shared `faults` | Rule validation, matching, ordered counters and effects |
+| shared `faults` | Public rule schema, common ordinal validation and ordered counters; service adapters own rule validation, matching and errors |
 
 A small `Route` enum and explicit `match` suffice. S3 domain errors and stored objects must not depend on Axum. Dependencies added during implementation should be limited to protocol necessities: XML parsing/serialization, percent encoding, date handling, and checksum algorithms; SDK and reqwest clients remain dev dependencies. Prefer established crates to handwritten XML or cryptographic primitives; select versions against the repository toolchain and MIT licensing policy.
 
@@ -48,7 +48,7 @@ Host determines addressing: `bucket.localhost/key` means bucket `bucket`, key `k
 
 Preserve the raw path until bucket/key parsing. Split the path-style bucket delimiter before decoding its components. Percent-decode once, preserve literal `+`, repeated slashes, and key case; never apply filesystem normalization. Reject malformed escapes or invalid UTF-8. Decode URI query values once with literal `+` preserved. Tagging uses its own form-encoding parser.
 
-**Extension seam:** future SSM adds the known JSON target prefix `AmazonSSM.` at target dispatch. Future Lambda adds its signing scope and exact REST patterns such as `/2015-03-31/functions/.../invocations`. Future explicitly configured HTTP stubs match exact method/path after AWS hints and before the weak path-style fallback. Explicitly signed S3 requests and bucket hosts retain object-path ownership, even when a key resembles another service's path. No future handlers or stub configuration are implemented now.
+**Extension seam:** the exact future SSM target, Lambda method/path space, configured plain HTTP pairs, precedence and path-style collisions are documented in [the architecture contract](../ARCHITECTURE.md#service-routing-and-s3). Explicitly signed S3 requests and bucket hosts retain object-path ownership ahead of future REST reservations, even when a key resembles another service's path; target precedence still applies. No future handlers or stub configuration are implemented now.
 
 ## 3. Buckets and object operations
 
@@ -91,7 +91,7 @@ Recognize `x-amz-sdk-checksum-algorithm`, `x-amz-checksum-sha256`, `x-amz-checks
 
 HTTP transfer framing belongs to the HTTP stack. `Content-Encoding: aws-chunked` is separate payload encoding and must be decoded before storage/hashing. Support the SDK's signed/unsigned streaming markers, chunk extensions, terminal chunk, and announced checksum trailers; parse but do not authenticate chunk signatures. Validate decoded length and reject malformed/truncated framing or missing trailers. Strip only `aws-chunked` from stored representation encoding. Explicit `Content-MD5`, if supplied, must be validated against decoded bytes rather than ignored. [PutObject integrity](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html)
 
-The existing 32 MiB collected-wire-body limit remains the bounded input limit; framing consumes part of it. S3 overflow returns `EntityTooLarge`, without mutation. DynamoDB retains its current limit and distinct BatchWriteItem/serialization errors. A premature body termination or declared decoded-length mismatch fails without publication. `x-amz-content-sha256` is signing/transport information, separate from the S3 object checksum.
+S3 has an intentional 64 MiB decoded object limit to bound per-object in-memory storage, independent of DynamoDB's 32 MiB JSON body path. Its 65 MiB collected-wire-body limit permits up to 1 MiB of aws-chunked framing/trailers at maximum object size; excessive framing also fails. Either overflow returns `EntityTooLarge` before fault selection or mutation. Collection and decoding complete before acquiring storage locks. DynamoDB retains its current limit and distinct BatchWriteItem/serialization errors. A premature body termination or declared decoded-length mismatch fails without publication. `x-amz-content-sha256` is signing/transport information, separate from the S3 object checksum.
 
 ## 6. Listing and continuation
 

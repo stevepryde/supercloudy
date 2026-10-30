@@ -1,7 +1,8 @@
+pub(crate) mod faults;
 mod http;
 mod protocol;
 
-use crate::dynamodb::faults::Faults;
+use crate::faults::Faults;
 use axum::{body::to_bytes, extract::Request, http::Method, response::Response};
 use base64::{
     Engine,
@@ -13,6 +14,11 @@ use sha2::Sha256;
 use std::{collections::BTreeMap, sync::Arc};
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
+
+// Bound in-memory objects independently of DynamoDB's JSON request policy.
+const MAX_OBJECT_BYTES: usize = 64 * 1024 * 1024;
+// Allow an additional MiB for aws-chunked framing and checksum trailers.
+const MAX_WIRE_BODY_BYTES: usize = MAX_OBJECT_BYTES + 1024 * 1024;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -181,7 +187,7 @@ impl Service {
             Some("ENABLED") => true,
             _ => return Err(Error::invalid("Invalid checksum mode")),
         };
-        let wire = to_bytes(request.into_body(), 32 * 1024 * 1024)
+        let wire = to_bytes(request.into_body(), MAX_WIRE_BODY_BYTES)
             .await
             .map_err(|error| {
                 use std::error::Error as _;
@@ -195,6 +201,9 @@ impl Service {
                 }
             })?;
         let bytes = http::body(&wire, &mut fields)?;
+        if bytes.len() > MAX_OBJECT_BYTES {
+            return Err(Error::new("EntityTooLarge", "Object exceeds 64 MiB limit"));
+        }
         match operation {
             "CreateBucket" => {
                 create_configuration(&bytes)?;
