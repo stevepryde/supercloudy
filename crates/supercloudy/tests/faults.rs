@@ -284,6 +284,12 @@ async fn transaction_fault_reasons_are_aligned_and_no_write_is_published() {
     };
     assert_eq!(error.raw_response().unwrap().status().as_u16(), 400);
     assert_eq!(
+        canceled.message(),
+        Some(
+            "Transaction cancelled, please refer cancellation reasons for specific reasons [None, TransactionConflict, None]"
+        )
+    );
+    assert_eq!(
         canceled
             .cancellation_reasons()
             .iter()

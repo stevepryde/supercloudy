@@ -206,13 +206,7 @@ impl Faults {
                         json!({"Code": code.as_str(), "Message": null})
                     })
                     .collect::<Vec<_>>();
-                Effect::Error(
-                    Error::new(
-                        "TransactionCanceledException",
-                        "Injected transaction cancellation",
-                    )
-                    .with_detail("CancellationReasons", json!(reasons)),
-                )
+                Effect::Error(Error::transaction_canceled(reasons))
             }
             FaultEffect::BatchDeferral { positions } => Effect::BatchDeferral(positions.clone()),
         })

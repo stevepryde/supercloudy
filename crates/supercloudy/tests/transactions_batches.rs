@@ -183,6 +183,12 @@ async fn transactions_stage_all_actions_and_return_ordered_cancellation_images()
         .unwrap_err();
     let aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(failure) = error.as_service_error().unwrap() else { panic!("expected transaction cancellation: {error:?}"); };
     assert_eq!(
+        failure.message(),
+        Some(
+            "Transaction cancelled, please refer cancellation reasons for specific reasons [None, None, ConditionalCheckFailed]"
+        )
+    );
+    assert_eq!(
         failure
             .cancellation_reasons()
             .iter()
@@ -443,6 +449,12 @@ async fn transaction_validation_and_aggregate_sizes_leave_no_partial_writes() {
         .await
         .unwrap_err();
     let aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(failure) = error.as_service_error().unwrap() else { panic!("expected transaction cancellation: {error:?}"); };
+    assert_eq!(
+        failure.message(),
+        Some(
+            "Transaction cancelled, please refer cancellation reasons for specific reasons [None, ValidationError]"
+        )
+    );
     let reasons = failure.cancellation_reasons();
     assert_eq!(reasons[1].code(), Some("ValidationError"));
     assert!(e.get("synthetic-sizes", "good").await.is_none());
@@ -718,6 +730,52 @@ async fn batches_validate_all_requests_and_support_multi_table_gets_and_deletes(
             .as_service_error()
             .unwrap()
             .code(),
+        Some("ValidationException")
+    );
+}
+
+#[tokio::test]
+async fn batch_get_enforces_the_total_key_limit_across_tables() {
+    let e = Emulator::new().await;
+    for table in ["synthetic-batch-a", "synthetic-batch-b"] {
+        e.table(table, false, false).await;
+        e.client
+            .put_item()
+            .table_name(table)
+            .set_item(Some(item("row-0", "1")))
+            .send()
+            .await
+            .unwrap();
+    }
+    let keys = (0..51)
+        .map(|i| key(&format!("row-{i}")))
+        .collect::<Vec<_>>();
+    let request = |second_count| {
+        e.client
+            .batch_get_item()
+            .request_items(
+                "synthetic-batch-a",
+                KeysAndAttributes::builder()
+                    .set_keys(Some(keys[..50].to_vec()))
+                    .build()
+                    .unwrap(),
+            )
+            .request_items(
+                "synthetic-batch-b",
+                KeysAndAttributes::builder()
+                    .set_keys(Some(keys[..second_count].to_vec()))
+                    .build()
+                    .unwrap(),
+            )
+    };
+    let output = request(50).send().await.unwrap();
+    for table in ["synthetic-batch-a", "synthetic-batch-b"] {
+        assert_eq!(output.responses().unwrap()[table], vec![item("row-0", "1")]);
+    }
+    assert!(output.unprocessed_keys().is_none_or(HashMap::is_empty));
+    let error = request(51).send().await.unwrap_err();
+    assert_eq!(
+        error.as_service_error().unwrap().code(),
         Some("ValidationException")
     );
 }

@@ -20,6 +20,20 @@ impl Error {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::new("ValidationException", message)
     }
+    pub fn transaction_canceled(reasons: Vec<Value>) -> Self {
+        let codes = reasons
+            .iter()
+            .map(|reason| reason["Code"].as_str().expect("cancellation reason code"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Self::new(
+            "TransactionCanceledException",
+            format!(
+                "Transaction cancelled, please refer cancellation reasons for specific reasons [{codes}]"
+            ),
+        )
+        .with_detail("CancellationReasons", Value::Array(reasons))
+    }
     pub fn with_status(mut self, status: u16) -> Self {
         self.status = status;
         self

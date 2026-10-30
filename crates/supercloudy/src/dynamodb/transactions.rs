@@ -251,10 +251,7 @@ pub(crate) fn prepare_write(db: &Database, r: &WriteRequest) -> Result<WritePlan
         return Err(Error::validation("Transaction exceeds 4 MiB"));
     }
     if failed {
-        return Err(
-            Error::new("TransactionCanceledException", "Transaction cancelled")
-                .with_detail("CancellationReasons", Json::Array(reasons)),
-        );
+        return Err(Error::transaction_canceled(reasons));
     }
     Ok(WritePlan {
         changes,
