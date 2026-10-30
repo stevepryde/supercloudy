@@ -9,7 +9,7 @@ mod transactions;
 mod value;
 
 use error::{Error, Result};
-use faults::{Effect, FaultConfig, FaultConfigError, Faults};
+use faults::{Effect, Faults};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -42,11 +42,11 @@ pub(crate) fn operation(target: Option<&str>) -> Option<&str> {
         })
 }
 impl Service {
-    pub fn with_faults(config: FaultConfig) -> std::result::Result<Self, FaultConfigError> {
-        Ok(Self {
+    pub fn with_scheduler(faults: Faults) -> Self {
+        Self {
             database: Arc::default(),
-            faults: Faults::new(config)?,
-        })
+            faults,
+        }
     }
     fn fault(&self, op: &str, raw: &Value) -> Result<batches::Deferred> {
         match self.faults.effect(op, raw) {

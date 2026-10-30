@@ -20,23 +20,29 @@ enum Command {
         /// JSON file containing explicit deterministic fault rules.
         #[arg(long)]
         faults: Option<PathBuf>,
+        /// Create an in-memory S3 bucket (repeatable).
+        #[arg(long = "bucket")]
+        buckets: Vec<String>,
     },
 }
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let Cli {
-        command: Command::Up { port, faults },
+        command: Command::Up {
+            port,
+            faults,
+            buckets,
+        },
     } = Cli::parse();
-    let router = match faults {
-        Some(path) => {
-            let config = serde_json::from_slice(&std::fs::read(path)?)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-            supercloudy::server::router_with_faults(config)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?
-        }
-        None => supercloudy::server::router(),
+    let faults = match faults {
+        Some(path) => serde_json::from_slice(&std::fs::read(path)?)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
+        None => Default::default(),
     };
+    let router =
+        supercloudy::server::router_with_config(supercloudy::server::Config { faults, buckets })
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     println!("Listening on http://{}", listener.local_addr()?);
     axum::serve(listener, router)
