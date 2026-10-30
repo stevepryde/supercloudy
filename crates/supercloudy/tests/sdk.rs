@@ -505,19 +505,18 @@ async fn condition_grammar_functions_aliases_and_missing_values() {
         e.get("synthetic-items", key()).await.unwrap()["checked"],
         Av::Bool(true)
     );
-    let err = c
-        .delete_item()
+    c.update_item()
         .table_name("synthetic-items")
         .set_key(Some(key()))
+        .update_expression("SET checked = :v")
         .condition_expression("absent <> :v")
         .expression_attribute_values(":v", n("0"))
         .send()
         .await
-        .unwrap_err();
-    assert!(
-        err.as_service_error()
-            .unwrap()
-            .is_conditional_check_failed_exception()
+        .unwrap();
+    assert_eq!(
+        e.get("synthetic-items", key()).await.unwrap()["checked"],
+        n("0")
     );
     // AND binds more tightly than OR.
     c.delete_item()
@@ -529,6 +528,168 @@ async fn condition_grammar_functions_aliases_and_missing_values() {
         .send()
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn missing_attributes_compare_unequal_in_conditional_puts() {
+    let e = Emulator::new().await;
+    e.table("synthetic-items", None).await;
+    for condition in ["#absent <> :v", ":v <> #absent", "doc.#absent <> :v"] {
+        e.client
+            .put_item()
+            .table_name("synthetic-items")
+            .set_item(Some(map(&[
+                ("pk", s("item-1")),
+                ("doc", Av::M(map(&[("keep", n("1"))]))),
+                ("checked", s(condition)),
+            ])))
+            .condition_expression(condition)
+            .expression_attribute_names("#absent", "missing")
+            .expression_attribute_values(":v", n("0"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            e.get("synthetic-items", key()).await.unwrap()["checked"],
+            s(condition)
+        );
+    }
+}
+
+#[tokio::test]
+async fn reversed_between_bounds_are_validation_errors_and_preserve_items() {
+    let e = Emulator::new().await;
+    e.table("synthetic-items", Some(ScalarAttributeType::N))
+        .await;
+    let original = map(&[("pk", s("item-1")), ("sk", n("3"))]);
+    e.client
+        .put_item()
+        .table_name("synthetic-items")
+        .set_item(Some(original.clone()))
+        .send()
+        .await
+        .unwrap();
+    for (condition, low, high) in [
+        ("sk BETWEEN :low AND :high", n("5"), n("1")),
+        ("absent BETWEEN :low AND :high", s("z"), s("a")),
+        (":low BETWEEN sk AND :high", n("5"), n("1")),
+        (
+            "attribute_exists(pk) OR sk BETWEEN :low AND :high",
+            n("5"),
+            n("1"),
+        ),
+    ] {
+        let err = e
+            .client
+            .delete_item()
+            .table_name("synthetic-items")
+            .set_key(Some(original.clone()))
+            .condition_expression(condition)
+            .expression_attribute_values(":low", low)
+            .expression_attribute_values(":high", high)
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.as_service_error().unwrap().code(),
+            Some("ValidationException")
+        );
+        assert_eq!(
+            e.get("synthetic-items", original.clone()).await.unwrap(),
+            original
+        );
+    }
+    // Invalid literal bounds must also fail on an empty Query result.
+    let err = e
+        .client
+        .query()
+        .table_name("synthetic-items")
+        .key_condition_expression("pk = :p AND sk BETWEEN :low AND :high")
+        .expression_attribute_values(":p", s("empty"))
+        .expression_attribute_values(":low", n("5"))
+        .expression_attribute_values(":high", n("1"))
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_service_error().unwrap().code(),
+        Some("ValidationException")
+    );
+}
+
+#[tokio::test]
+async fn item_size_limit_rejects_oversized_puts_and_updates_atomically() {
+    let e = Emulator::new().await;
+    e.table("synthetic-items", None).await;
+    // pk + item-1 + payload = 15 UTF-8 bytes; values fill the remaining 400 KiB.
+    for payload in [
+        s(&"é".repeat(204_792)), // 409,584 value bytes, one byte below the limit.
+        Av::B(Blob::new(vec![0; 409_585])), // Exactly the limit, before base64 encoding.
+    ] {
+        let item = map(&[("pk", s("item-1")), ("payload", payload)]);
+        e.client
+            .put_item()
+            .table_name("synthetic-items")
+            .set_item(Some(item.clone()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(e.get("synthetic-items", key()).await.unwrap(), item);
+    }
+    let original = e.get("synthetic-items", key()).await.unwrap();
+    for payload in [
+        s(&"x".repeat(500 * 1024)),
+        Av::B(Blob::new(vec![0; 409_586])), // One byte over, counting names and key.
+        Av::M(map(&[("x", Av::L(vec![s(&"x".repeat(409_577))]))])),
+        Av::Ss(vec!["x".repeat(204_793), "y".repeat(204_793)]),
+    ] {
+        let err = e
+            .client
+            .put_item()
+            .table_name("synthetic-items")
+            .set_item(Some(map(&[("pk", s("item-1")), ("payload", payload)])))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.as_service_error().unwrap().code(),
+            Some("ValidationException")
+        );
+        assert_eq!(e.get("synthetic-items", key()).await.unwrap(), original);
+    }
+    let err = e
+        .client
+        .update_item()
+        .table_name("synthetic-items")
+        .set_key(Some(key()))
+        .update_expression("SET extra = :v")
+        .expression_attribute_values(":v", Av::Bool(true))
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_service_error().unwrap().code(),
+        Some("ValidationException")
+    );
+    assert_eq!(e.get("synthetic-items", key()).await.unwrap(), original);
+    let err = e
+        .client
+        .put_item()
+        .table_name("synthetic-items")
+        .item("pk", s("absent-item"))
+        .item("payload", s(&"x".repeat(500 * 1024)))
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_service_error().unwrap().code(),
+        Some("ValidationException")
+    );
+    assert!(
+        e.get("synthetic-items", map(&[("pk", s("absent-item"))]))
+            .await
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -1016,16 +1177,22 @@ async fn nested_return_values_select_only_paths_present_in_the_image() {
         .unwrap()
         .attributes
         .unwrap();
+    assert_eq!(old, map(&[("doc", Av::M(map(&[("a", n("1"))])))]));
+    let new = c
+        .update_item()
+        .table_name("synthetic-items")
+        .set_key(Some(key()))
+        .update_expression("SET doc.a = :v, doc.fresh = :v")
+        .expression_attribute_values(":v", n("9"))
+        .return_values(ReturnValue::UpdatedNew)
+        .send()
+        .await
+        .unwrap()
+        .attributes
+        .unwrap();
     assert_eq!(
-        old,
-        map(&[(
-            "doc",
-            Av::M(map(&[
-                ("a", n("1")),
-                ("fresh", n("2")),
-                ("keep", s("retained"))
-            ]))
-        )])
+        new,
+        map(&[("doc", Av::M(map(&[("a", n("9")), ("fresh", n("9"))])))])
     );
     let new = c
         .update_item()
@@ -1073,7 +1240,7 @@ async fn nested_return_values_select_only_paths_present_in_the_image() {
     let got = e.get("synthetic-items", key()).await.unwrap();
     assert_eq!(
         got["doc"],
-        Av::M(map(&[("fresh", n("2")), ("keep", s("retained"))]))
+        Av::M(map(&[("fresh", n("9")), ("keep", s("retained"))]))
     );
 }
 

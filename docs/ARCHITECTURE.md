@@ -78,7 +78,11 @@ CreateTable validates simple/composite schemas; tables become active immediately
 DescribeTable returns metadata. DeleteTable removes a table and its items atomically.
 GetItem omits `Item` for a missing item. PutItem replaces the complete item.
 UpdateItem can create an absent item using its supplied key. DeleteItem of an
-absent item succeeds unless a condition fails.
+absent item succeeds unless a condition fails. PutItem and UpdateItem reject
+candidate items larger than 400 KiB with ValidationException before committing.
+Item size counts UTF-8 attribute names and strings, decoded binary bytes, scalar
+and set values, and map/list element overhead, rather than JSON wire size.
+See [AWS item sizing](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/CapacityUnitCalculations.html).
 
 The tokenizer and recursive descent parser share paths and operands, with
 separate condition, update, and key-condition validation. Unsupported syntax
@@ -90,6 +94,8 @@ mutations are rejected.
 Conditions support comparisons, inclusive `BETWEEN`, `IN`, `AND`, `OR`, `NOT`,
 parentheses, `attribute_exists`, `attribute_not_exists`, `attribute_type`,
 `begins_with`, `contains`, and `size`. Missing paths are explicit evaluator state.
+A missing path compares unequal to a present value with `<>`. Reversed
+`BETWEEN` bounds return ValidationException, including on a missing target path.
 See [condition grammar](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.OperatorsAndFunctions.html).
 
 Updates support `SET`, `REMOVE`, `ADD`, `DELETE`, numeric arithmetic,
@@ -102,8 +108,9 @@ ReturnValues supports `NONE` (default) and `ALL_OLD` for PutItem/DeleteItem;
 UpdateItem also supports `ALL_NEW`, `UPDATED_OLD`, and `UPDATED_NEW`.
 `ReturnValuesOnConditionCheckFailure` is excluded.
 UPDATED modes select attributes whose exact touched path exists in the chosen
-image; a selected nested path returns its whole top-level document. Condition
-functions treat nonmatching stored types as false or undefined, while invalid
+image; nested map paths return only the selected leaves within their enclosing
+maps, omitting untouched siblings. Selected lists retain their complete value.
+Condition functions treat nonmatching stored types as false or undefined, while invalid
 literal operand types are rejected. String `size` follows UTF-16 code units.
 
 Query requires partition-key equality and optionally a sort-key comparison

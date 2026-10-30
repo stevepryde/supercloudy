@@ -67,6 +67,19 @@ pub(crate) fn validate_number(n: &BigDecimal) -> Result<()> {
     Ok(())
 }
 impl Value {
+    pub fn size_bytes(&self) -> usize {
+        match self {
+            Self::S(v) => v.len(),
+            Self::N(v) => number_size_bytes(v),
+            Self::B(v) => v.len(),
+            Self::Bool(_) | Self::Null => 1,
+            Self::Ss(v) => v.iter().map(String::len).sum(),
+            Self::Ns(v) => v.iter().map(number_size_bytes).sum(),
+            Self::Bs(v) => v.iter().map(Vec::len).sum(),
+            Self::L(v) => 3 + v.iter().map(|v| 1 + v.size_bytes()).sum::<usize>(),
+            Self::M(v) => 3 + v.len() + item_size_bytes(v),
+        }
+    }
     fn parse_at(v: &Json, depth: usize) -> Result<Self> {
         if depth > 32 {
             return Err(Error::validation("Document depth exceeds 32"));
@@ -211,6 +224,12 @@ impl Value {
             _ => Ok(()),
         }
     }
+}
+fn number_size_bytes(n: &BigDecimal) -> usize {
+    n.normalized().digits().div_ceil(2) as usize + 1
+}
+pub(crate) fn item_size_bytes(item: &Item) -> usize {
+    item.iter().map(|(k, v)| k.len() + v.size_bytes()).sum()
 }
 fn parse_item_at(v: &Json, depth: usize) -> Result<Item> {
     v.as_object()

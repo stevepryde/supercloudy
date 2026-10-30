@@ -3,7 +3,7 @@ use super::{
     error::{Error, Result},
     expressions::{Action, Condition, Operand, Parser, Segment, apply_updates},
     storage::{Database, Table},
-    value::{Item, Scalar, Value, parse_item, wire_item},
+    value::{Item, Scalar, Value, item_size_bytes, parse_item, wire_item},
 };
 use serde_json::{Value as Json, json};
 use std::{
@@ -175,6 +175,9 @@ pub(crate) fn write(db: &mut Database, op: &str, r: &Request) -> Result<Json> {
     };
     if let Some(item) = &candidate {
         table.key(item, false)?;
+        if item_size_bytes(item) > 400 * 1024 {
+            return Err(Error::validation("Item size exceeds 400 KB"));
+        }
     }
     let attributes = match mode {
         "ALL_OLD" => old.clone(),
@@ -195,15 +198,32 @@ pub(crate) fn write(db: &mut Database, op: &str, r: &Request) -> Result<Json> {
     Ok(response)
 }
 fn updated_attributes(item: &Item, actions: &[Action]) -> Item {
-    // Return the affected top-level attributes, retaining their document values.
-    actions
+    let mut selected = Item::new();
+    for action in actions
         .iter()
         .filter(|a| super::expressions::get_path(item, &a.path).is_some())
-        .filter_map(|a| match &a.path[0] {
-            Segment::Name(n) => item.get(n).map(|v| (n.clone(), v.clone())),
-            _ => None,
-        })
-        .collect()
+    {
+        copy_updated_map_path(item, &mut selected, &action.path);
+    }
+    selected
+}
+fn copy_updated_map_path(source: &Item, selected: &mut Item, path: &[Segment]) {
+    let Some((Segment::Name(name), tail)) = path.split_first() else {
+        return;
+    };
+    let Some(value) = source.get(name) else {
+        return;
+    };
+    if let (Value::M(children), [Segment::Name(_), ..]) = (value, tail) {
+        let projected = selected
+            .entry(name.clone())
+            .or_insert_with(|| Value::M(Item::new()));
+        if let Value::M(projected) = projected {
+            copy_updated_map_path(children, projected, tail);
+        }
+    } else {
+        selected.insert(name.clone(), value.clone());
+    }
 }
 fn create_table(db: &mut Database, r: &Request) -> Result<Json> {
     let mut schema = required(&r.key_schema, "KeySchema")?.clone();
@@ -390,14 +410,6 @@ fn validate_key_condition(table: &Table, c: &Condition) -> Result<()> {
             Scalar::from_value(v, tag, if index == 0 { 2048 } else { 1024 })?;
             if prefix && !matches!(v, Value::S(_) | Value::B(_)) {
                 return Err(Error::validation("Invalid begins_with key type"));
-            }
-        }
-        if values.len() == 2 {
-            let (Operand::Literal(a), Operand::Literal(b)) = (values[0], values[1]) else {
-                unreachable!()
-            };
-            if a.compare(b) == Some(std::cmp::Ordering::Greater) {
-                return Err(Error::validation("Invalid BETWEEN bounds"));
             }
         }
     }

@@ -291,7 +291,13 @@ impl Parser {
         if self.eat("BETWEEN") {
             let b = self.operand(false)?;
             self.expect("AND")?;
-            return Ok(Condition::Between(a, b, self.operand(false)?));
+            let c = self.operand(false)?;
+            if let (Operand::Literal(low), Operand::Literal(high)) = (&b, &c)
+                && low.compare(high) == Some(Ordering::Greater)
+            {
+                return Err(Error::validation("Invalid BETWEEN bounds"));
+            }
+            return Ok(Condition::Between(a, b, c));
         }
         if self.eat("IN") {
             self.expect("(")?;
@@ -442,15 +448,24 @@ impl Condition {
                     ">=" => a.compare(&b).is_some_and(|o| o != Ordering::Less),
                     _ => false,
                 },
+                (None, Some(_)) | (Some(_), None) => op == "<>",
                 _ => false,
             },
-            Self::Between(a, b, c) => match (a.eval(item)?, b.eval(item)?, c.eval(item)?) {
-                (Some(a), Some(b), Some(c)) => {
-                    a.compare(&b).is_some_and(|o| o != Ordering::Less)
-                        && a.compare(&c).is_some_and(|o| o != Ordering::Greater)
+            Self::Between(a, b, c) => {
+                let (a, b, c) = (a.eval(item)?, b.eval(item)?, c.eval(item)?);
+                if let (Some(low), Some(high)) = (&b, &c)
+                    && low.compare(high) == Some(Ordering::Greater)
+                {
+                    return Err(Error::validation("Invalid BETWEEN bounds"));
                 }
-                _ => false,
-            },
+                match (a, b, c) {
+                    (Some(a), Some(b), Some(c)) => {
+                        a.compare(&b).is_some_and(|o| o != Ordering::Less)
+                            && a.compare(&c).is_some_and(|o| o != Ordering::Greater)
+                    }
+                    _ => false,
+                }
+            }
             Self::In(a, list) => {
                 let a = a.eval(item)?;
                 let values = list
