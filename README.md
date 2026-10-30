@@ -48,7 +48,15 @@ Supported operations:
   writes, aliases, and atomic updates. Missing reads omit `Item`.
 - `Query`: partition-key equality, sort-key `=`, `<`, `<=`, `>`, `>=`, inclusive
   `BETWEEN`, and string/binary `begins_with`. Ascending/reverse ordering, `Limit`,
-  continuation keys, and `Select=COUNT` are supported.
+  continuation keys, filters, projections, and `Select=COUNT` are supported.
+- `Scan`: table/index reads, filters, projections, and segmented scans.
+- Global and local secondary indexes: sparse membership, ordered reads, and
+  `ALL`, `KEYS_ONLY`, and `INCLUDE` projections. Query/Scan pages honor both
+  `Limit` and the 1 MiB evaluated-data boundary.
+- `TransactWriteItems` / `TransactGetItems`: atomic writes and snapshot reads,
+  up to 100 actions, ordered cancellation reasons, and ten-minute write tokens.
+- `BatchGetItem` / `BatchWriteItem`: multi-table reads/writes and retryable
+  unprocessed subsets, with DynamoDB count and size limits.
 
 Conditions support comparisons, `BETWEEN`, `IN`, `AND`, `OR`, `NOT`, parentheses,
 `attribute_exists`, `attribute_not_exists`, `attribute_type`, `begins_with`,
@@ -59,24 +67,47 @@ for reserved words and literal attribute names containing dots.
 `PutItem`/`DeleteItem` support `NONE` and `ALL_OLD`; `UpdateItem` additionally supports
 `ALL_NEW`, `UPDATED_OLD`, and `UPDATED_NEW`. Failed conditions return the modeled
 `ConditionalCheckFailedException` and leave stored state unchanged.
+`ReturnValuesOnConditionCheckFailure=ALL_OLD` includes the previous item.
 
 All AttributeValue types are supported, including recursive maps/lists and sets.
 Numbers use exact decimal arithmetic with DynamoDB's 38 significant digit and
 magnitude constraints. Numeric key identity ignores spelling (`1` equals `1.0`).
 
-This is a scoped emulator, not full DynamoDB. There are no indexes, transactions,
-batch APIs, Scan, streams, TTL processing, IAM, capacity simulation, persistence,
-or account/region isolation. Filters, projections, legacy request forms, and
-`ReturnValuesOnConditionCheckFailure` are rejected. Query supports item-count
-paging but does not enforce the 1 MiB page boundary. Table size/capacity metadata
-is not simulated. Unimplemented operations return `UnknownOperationException`;
-unsupported options return `ValidationException`.
+This is a scoped emulator. Streams, TTL processing, IAM, capacity simulation,
+persistence, account/region isolation, online index changes, and legacy request
+forms remain excluded. Index visibility is immediate. Table size/capacity
+metadata is not simulated. Unimplemented operations return
+`UnknownOperationException`; unsupported options return `ValidationException`.
+
+## Deterministic faults
+
+Ordinary startup is fault-free. Explicitly load ordered rules to exercise retries:
+
+```sh
+supercloudy up --port 8137 --faults rules.json
+```
+
+```json
+{"rules":[{"operation":"PutItem","table":"synthetic-items","first_request":1,"repeat":2,"effect":{"type":"throttle"}}]}
+```
+
+Rules count fully validated matching requests per instance; the first eligible
+rule wins. A transaction cancellation rule applies only when the request has a
+non-`None` reason position; shorter requests leave that rule available.
+SDK retries count as new requests. Effects are `throttle` (HTTP 400),
+`internal_server_error` (HTTP 500), `transaction_canceled` with ordered `reasons`
+(for example `["None","TransactionConflict"]`), and `batch_deferral` with
+zero-based per-table `positions` (for example `{"synthetic-items":[0,2]}`).
+Errors precede mutation; batch deferral processes only the other actions.
+Invalid configurations fail startup. Use isolated instances and serial requests
+for repeatable fault scenarios. Library callers can use
+`server::router_with_faults(server::FaultConfig)`; `server::router()` has no faults.
 
 See [the architecture contract](docs/ARCHITECTURE.md) for behavior and boundaries.
 
 ## Development
 
-Use current stable Rust (validated with 1.96), rustfmt, Clippy, Bash, Git, find,
+Use current stable Rust (validated with 1.99.1), rustfmt, Clippy, Bash, Git, find,
 and awk. Run from the repository root:
 
 ```sh

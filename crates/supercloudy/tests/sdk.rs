@@ -1791,6 +1791,8 @@ async fn query_limit_boundaries_and_cursor_scope_match_dynamodb() {
     assert_eq!(empty.count(), 0);
     assert!(empty.last_evaluated_key.is_none());
     for cursor in [
+        map(&[("pk", s("group"))]),
+        map(&[("pk", s("group")), ("sk", s("b")), ("extra", s("value"))]),
         map(&[("pk", s("other")), ("sk", s("b"))]),
         map(&[("pk", s("group")), ("sk", s("a"))]),
     ] {

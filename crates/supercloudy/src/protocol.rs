@@ -29,6 +29,18 @@ pub(crate) fn error(code: &str, message: &str) -> Response {
         StatusCode::BAD_REQUEST,
     )
 }
+pub(crate) fn modeled_error(error: crate::dynamodb::error::Error) -> Response {
+    let mut body = error.details;
+    body.insert(
+        "__type".into(),
+        json!(format!("com.amazonaws.dynamodb.v20120810#{}", error.code)),
+    );
+    body.insert("message".into(), json!(error.message));
+    response(
+        Value::Object(body),
+        StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+    )
+}
 pub(crate) fn unknown_operation() -> Response {
     error("UnknownOperationException", "Unknown operation")
 }
