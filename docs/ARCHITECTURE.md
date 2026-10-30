@@ -1,16 +1,17 @@
 # supercloudy architecture
 
-Status: in-memory DynamoDB behavior milestone.
+Status: in-memory DynamoDB and S3 behavior milestones.
 
 ## Scope
 
-supercloudy is an independent Rust process serving a subset of DynamoDB's real
-JSON wire protocol. Consumers use ordinary AWS SDKs against a local endpoint.
+supercloudy is an independent Rust process serving subsets of DynamoDB's JSON
+wire protocol and S3's REST/XML protocol on one listener. Consumers use ordinary AWS SDKs against a local endpoint.
 There are no consumer dependencies, persistent storage, cloud calls, or cloud
 credentials. Fixtures and examples are synthetic; dummy credentials are `test`.
 
 The `supercloudy up --port <u16>` CLI binds `127.0.0.1`, defaults to port 8000,
-prints its actual address, and serves until interrupted. Port 0 selects a random
+prints its actual address, and serves until interrupted. Repeatable `--bucket`
+flags initialize S3 buckets. Port 0 selects a random
 available port. Bind errors exit nonzero.
 
 ## Modules
@@ -21,7 +22,12 @@ Every crate inherits the workspace MIT license. Cargo.lock is retained.
 | Module | Responsibility |
 | --- | --- |
 | `main` | CLI, loopback listener, Ctrl-C shutdown |
-| `server` | HTTP routing, target selection, bounded body collection |
+| `server` | Validated configuration, isolated service construction, request entry point |
+| `routing` | Target/signing-scope/REST precedence before body consumption |
+| `s3` | Atomic in-memory bucket/object operations, ranges, checksums, listing |
+| `s3/http` | URI/header decoding, presign expiry, bounded aws-chunked payload decoding |
+| `s3/protocol` | REST/XML responses, HTTP metadata and errors |
+| `faults` | Shared rule validation, ordered scheduling and per-instance counters |
 | `protocol` | AWS JSON response envelope and request IDs |
 | `dynamodb/api` | Request decoding structures |
 | `dynamodb/value` | Tagged AttributeValues, exact decimals, scalar key ordering |
@@ -30,18 +36,40 @@ Every crate inherits the workspace MIT license. Cargo.lock is retained.
 | `dynamodb/operations` | Table/item preparation, indexed reads, shared pagination |
 | `dynamodb/transactions` | Staged atomic writes, snapshot Gets, successful token records |
 | `dynamodb/batches` | Whole-request validation, size limits, unprocessed subsets |
-| `dynamodb/faults` | Explicit ordered rules and per-instance counters |
+| `dynamodb/faults` | DynamoDB fault eligibility and modeled-error adapter |
 | `dynamodb/error` | Domain errors |
 
 Domain code does not depend on Axum. There is no backend trait, mock interface,
-service registry, or persistence adapter. Runtime dependencies are Axum, Tokio,
-Clap, Serde/serde_json, base64, and BigDecimal. The AWS SDK is a dev dependency.
+service registry, or persistence adapter. Runtime dependencies include Axum, Tokio, Clap, Serde/serde_json, base64,
+BigDecimal, quick-xml, time/httpdate, percent-encoding, and checksum algorithms.
+AWS SDKs and reqwest are dev dependencies.
 `dynamodb/reserved.txt` contains DynamoDB's public
 [reserved word list](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ReservedWords.html).
 
+## Service routing and S3
+
+Any `X-Amz-Target` owns dispatch before REST hints, preserving DynamoDB protocol
+errors. Without it, explicit SigV4 signing scope selects S3 or rejects unsupported
+services. A `<bucket>.localhost` authority then selects S3, followed by non-root
+path-style requests. Unsigned root requests retain the unknown-operation envelope.
+Conflicting or malformed routing information fails before execution. No registry,
+plugin trait, or speculative service implementation is introduced.
+
+S3 owns a separate ordered bucket/object map and lock. Put, Copy (including across
+buckets), and Delete validate before publication under that lock. Reads clone
+committed object data and release guards before XML serialization or network I/O.
+Faults share one ordered scheduler while each service owns eligibility and errors.
+
+The detailed S3 protocol contract, addressing, supported operations, checksum and
+presign semantics, and extension points are recorded in the retained
+[service routing design](plans/service-routing-s3.md). Both services remain entirely
+in memory. S3 does not authenticate signatures, perform encryption, or contact KMS.
+Virtual-host addressing requires the client's resolver to reach wildcard localhost;
+HTTP routing cannot supply DNS.
+
 ## HTTP and encoding
 
-Requests use `POST /`, `Content-Type: application/x-amz-json-1.0`, and
+DynamoDB requests use `POST /`, `Content-Type: application/x-amz-json-1.0`, and
 `X-Amz-Target: DynamoDB_20120810.<Operation>`. Target selection precedes body
 decoding. Missing/unknown targets, wrong paths/methods, and unimplemented
 operations return HTTP 400 `UnknownOperationException` with namespace
@@ -203,7 +231,7 @@ processed writes. Requests never require top-level TableName for multi-item APIs
 ## Explicit fault configuration
 
 `up --faults <json-file>` and `server::router_with_faults` accept explicit ordered
-rules; ordinary CLI/router construction enables none. Each rule selects an
+rules; ordinary CLI/router construction enables none. Each DynamoDB rule selects an
 operation, optional table, positive first_request ordinal and repeat count, and
 an effect. Counters belong to one instance and advance only after complete
 validation; failed conditions do not advance them. All matching counters advance,
@@ -230,7 +258,7 @@ ValidationException rather than changing results silently.
 Table byte-size/capacity statistics are not simulated.
 
 Required checks are listed in [AGENTS.md](../AGENTS.md). Integration scenarios use
-Rust `aws-sdk-dynamodb` against independent real loopback listeners on random
+Rust `aws-sdk-dynamodb` and `aws-sdk-s3` against independent real loopback listeners on random
 ports, with explicit endpoint_url and dummy credentials. They exercise every
 operation, typed values, conditions and error decoding, nested updates,
 pre-update operands, numeric identity/order, range/prefix queries, pagination,
