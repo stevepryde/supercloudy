@@ -90,7 +90,9 @@ separate condition, update, and key-condition validation. Unsupported syntax
 fails explicitly. Aliases resolve to literal attribute segments: `#a` mapped to
 `a.b` denotes one name; `#a.#b` is nested. Missing/unused aliases and values,
 reserved unaliased words, invalid types, overlapping update paths, and key
-mutations are rejected.
+mutations are rejected. Attribute names cannot be empty, including within maps.
+Document paths allow up to 32 dereference operators (dots or list indices),
+excluding the root attribute name.
 
 Conditions support comparisons, inclusive `BETWEEN`, `IN`, `AND`, `OR`, `NOT`,
 parentheses, `attribute_exists`, `attribute_not_exists`, `attribute_type`,
@@ -104,6 +106,7 @@ Updates support `SET`, `REMOVE`, `ADD`, `DELETE`, numeric arithmetic,
 the pre-update item. A separate candidate is built, validated, then committed.
 List removals use original indices. See
 [AWS update semantics](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.UpdateExpressions.html).
+`if_not_exists` can nest inside update functions; `list_append` cannot.
 
 ReturnValues supports `NONE` (default) and `ALL_OLD` for PutItem/DeleteItem;
 UpdateItem also supports `ALL_NEW`, `UPDATED_OLD`, and `UPDATED_NEW`.
@@ -118,7 +121,8 @@ literal operand types are rejected. String `size` follows UTF-16 code units.
 
 Query requires partition-key equality and optionally a sort-key comparison
 (`=`, `<`, `<=`, `>`, `>=`), inclusive `BETWEEN`, or string/binary `begins_with`.
-Non-key references and general condition predicates are invalid. Results sort
+Non-key references and general condition predicates are invalid. Key comparison
+operands can place the key on either side of the comparator. Results sort
 ascending by key, reversed for `ScanIndexForward=false`. Positive `Limit`,
 `ExclusiveStartKey`, `LastEvaluatedKey`, and `Select=COUNT` are supported.
 Continuation compares keys even after deletion of the last item in an earlier

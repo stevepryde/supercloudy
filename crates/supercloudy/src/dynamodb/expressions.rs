@@ -48,6 +48,14 @@ pub(crate) struct Parser {
 fn invalid() -> Error {
     Error::validation("Invalid or unsupported expression")
 }
+fn validate_ordered_literals(operands: &[&Operand]) -> Result<()> {
+    if operands.iter().any(|operand| {
+        matches!(operand, Operand::Literal(value) if !matches!(value, Value::S(_) | Value::N(_) | Value::B(_)))
+    }) {
+        return Err(Error::validation("Ordering requires string, number, or binary operands"));
+    }
+    Ok(())
+}
 fn tokenize(s: &str) -> Result<Vec<String>> {
     if s.is_empty() || s.len() > 4096 {
         return Err(invalid());
@@ -180,7 +188,7 @@ impl Parser {
             } else {
                 break;
             }
-            if path.len() > 32 {
+            if path.len() > 33 {
                 return Err(invalid());
             }
         }
@@ -212,6 +220,14 @@ impl Parser {
                 vec![a, self.operand(update)?]
             };
             self.expect(")")?;
+            if args
+                .iter()
+                .any(|arg| matches!(arg, Operand::Function(f, _) if f == "list_append"))
+            {
+                return Err(Error::validation(
+                    "list_append cannot be nested inside another function",
+                ));
+            }
             if (name == "size" || name == "if_not_exists") && !matches!(args[0], Operand::Path(_)) {
                 return Err(invalid());
             }
@@ -292,8 +308,9 @@ impl Parser {
             let b = self.operand(false)?;
             self.expect("AND")?;
             let c = self.operand(false)?;
+            validate_ordered_literals(&[&a, &b, &c])?;
             if let (Operand::Literal(low), Operand::Literal(high)) = (&b, &c)
-                && low.compare(high) == Some(Ordering::Greater)
+                && (low.tag() != high.tag() || low.compare(high) == Some(Ordering::Greater))
             {
                 return Err(Error::validation("Invalid BETWEEN bounds"));
             }
@@ -315,7 +332,11 @@ impl Parser {
         if !["=", "<>", "<", "<=", ">", ">="].contains(&op.as_str()) {
             return Err(invalid());
         }
-        Ok(Condition::Compare(a, op, self.operand(false)?))
+        let b = self.operand(false)?;
+        if op != "=" && op != "<>" {
+            validate_ordered_literals(&[&a, &b])?;
+        }
+        Ok(Condition::Compare(a, op, b))
     }
     pub fn updates(&mut self, s: &str) -> Result<Vec<Action>> {
         self.start(s)?;

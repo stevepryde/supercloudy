@@ -235,7 +235,12 @@ fn parse_item_at(v: &Json, depth: usize) -> Result<Item> {
     v.as_object()
         .ok_or_else(|| Error::validation("Expected attribute map"))?
         .iter()
-        .map(|(k, v)| Ok((k.clone(), Value::parse_at(v, depth)?)))
+        .map(|(k, v)| {
+            if k.is_empty() {
+                return Err(Error::validation("Attribute names cannot be empty"));
+            }
+            Ok((k.clone(), Value::parse_at(v, depth)?))
+        })
         .collect()
 }
 pub(crate) fn parse_item(v: &Json) -> Result<Item> {

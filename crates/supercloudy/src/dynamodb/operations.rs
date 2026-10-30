@@ -407,7 +407,11 @@ fn validate_key_condition(table: &Table, c: &Condition) -> Result<()> {
     for c in clauses {
         let (operand, values, eq, prefix) = match c {
             Condition::Compare(a, op, b) if ["=", "<", "<=", ">", ">="].contains(&op.as_str()) => {
-                (a, vec![b], op == "=", false)
+                if matches!(a, Operand::Literal(_)) {
+                    (b, vec![a], op == "=", false)
+                } else {
+                    (a, vec![b], op == "=", false)
+                }
             }
             Condition::Between(a, b, c) => (a, vec![b, c], false, false),
             Condition::Function(f, args) if f == "begins_with" => {

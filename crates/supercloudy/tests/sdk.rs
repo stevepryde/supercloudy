@@ -482,6 +482,56 @@ async fn update_documents_sets_and_list_functions() {
 }
 
 #[tokio::test]
+async fn nested_list_append_is_rejected_but_nested_if_not_exists_is_supported() {
+    let e = Emulator::new().await;
+    e.table("synthetic-items", None).await;
+    let original = map(&[("pk", s("item-1")), ("entries", Av::L(vec![n("1")]))]);
+    e.client
+        .put_item()
+        .table_name("synthetic-items")
+        .set_item(Some(original.clone()))
+        .send()
+        .await
+        .unwrap();
+    for expression in [
+        "SET entries = if_not_exists(entries, list_append(:v, :v))",
+        "SET entries = list_append(list_append(:v, :v), :v)",
+        "SET entries = list_append(:v, list_append(:v, :v))",
+    ] {
+        let error = e
+            .client
+            .update_item()
+            .table_name("synthetic-items")
+            .set_key(Some(key()))
+            .update_expression(expression)
+            .expression_attribute_values(":v", Av::L(vec![n("2")]))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_service_error().unwrap().code(),
+            Some("ValidationException"),
+            "{expression}"
+        );
+        assert_eq!(e.get("synthetic-items", key()).await.unwrap(), original);
+    }
+    e.client
+        .update_item()
+        .table_name("synthetic-items")
+        .set_key(Some(key()))
+        .update_expression(
+            "SET fresh = list_append(if_not_exists(absent, if_not_exists(another_missing, :v)), :v)",
+        )
+        .expression_attribute_values(":v", Av::L(vec![n("2")]))
+        .send()
+        .await
+        .unwrap();
+    let got = e.get("synthetic-items", key()).await.unwrap();
+    assert_eq!(got["entries"], Av::L(vec![n("1")]));
+    assert_eq!(got["fresh"], Av::L(vec![n("2"), n("2")]));
+}
+
+#[tokio::test]
 async fn condition_grammar_functions_aliases_and_missing_values() {
     let e = Emulator::new().await;
     e.table("synthetic-items", None).await;
@@ -554,6 +604,80 @@ async fn missing_attributes_compare_unequal_in_conditional_puts() {
             s(condition)
         );
     }
+}
+
+#[tokio::test]
+async fn invalid_condition_literal_types_are_rejected_before_writing() {
+    let e = Emulator::new().await;
+    e.table("synthetic-items", None).await;
+    let original = map(&[
+        ("pk", s("item-1")),
+        ("payload", s("abc")),
+        ("revision", n("1")),
+    ]);
+    e.client
+        .put_item()
+        .table_name("synthetic-items")
+        .set_item(Some(original.clone()))
+        .send()
+        .await
+        .unwrap();
+    for (expression, operands) in [
+        ("payload < :v", map(&[(":v", Av::M(HashMap::new()))])),
+        (":v > payload", map(&[(":v", Av::Bool(true))])),
+        ("payload <= :v", map(&[(":v", Av::Null(true))])),
+        ("payload > :v", map(&[(":v", Av::L(vec![]))])),
+        ("payload >= :v", map(&[(":v", Av::Ss(vec!["x".into()]))])),
+        (
+            "absent BETWEEN :low AND :high",
+            map(&[(":low", s("a")), (":high", n("3"))]),
+        ),
+        (
+            "payload BETWEEN :low AND :high",
+            map(&[
+                (":low", Av::M(HashMap::new())),
+                (":high", Av::M(HashMap::new())),
+            ]),
+        ),
+    ] {
+        let mut values = operands;
+        values.insert(":next".into(), n("2"));
+        let error = e
+            .client
+            .update_item()
+            .table_name("synthetic-items")
+            .set_key(Some(key()))
+            .update_expression("SET revision = :next")
+            .condition_expression(format!("attribute_exists(pk) OR {expression}"))
+            .set_expression_attribute_values(Some(values))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_service_error().unwrap().code(),
+            Some("ValidationException"),
+            "{expression}"
+        );
+        assert_eq!(e.get("synthetic-items", key()).await.unwrap(), original);
+    }
+    // Stored types remain an evaluation mismatch, rather than invalid input.
+    let error = e
+        .client
+        .delete_item()
+        .table_name("synthetic-items")
+        .set_key(Some(key()))
+        .condition_expression("payload < :v")
+        .expression_attribute_values(":v", n("3"))
+        .send()
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .as_service_error()
+            .unwrap()
+            .is_conditional_check_failed_exception()
+    );
+    assert_eq!(e.get("synthetic-items", key()).await.unwrap(), original);
 }
 
 #[tokio::test]
@@ -690,6 +814,114 @@ async fn item_size_limit_rejects_oversized_puts_and_updates_atomically() {
             .await
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn empty_attribute_names_are_rejected_without_changing_items() {
+    let e = Emulator::new().await;
+    e.table("synthetic-items", None).await;
+    let original = map(&[("pk", s("item-1")), ("payload", s("original"))]);
+    e.client
+        .put_item()
+        .table_name("synthetic-items")
+        .set_item(Some(original.clone()))
+        .send()
+        .await
+        .unwrap();
+    for invalid in [
+        map(&[("pk", s("item-1")), ("", s("invalid"))]),
+        map(&[("pk", s("item-1")), ("doc", Av::M(map(&[("", n("1"))])))]),
+    ] {
+        let error = e
+            .client
+            .put_item()
+            .table_name("synthetic-items")
+            .set_item(Some(invalid))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_service_error().unwrap().code(),
+            Some("ValidationException")
+        );
+        assert_eq!(e.get("synthetic-items", key()).await.unwrap(), original);
+    }
+    let error = e
+        .client
+        .update_item()
+        .table_name("synthetic-items")
+        .set_key(Some(key()))
+        .update_expression("SET doc = :v")
+        .expression_attribute_values(":v", Av::M(map(&[("", n("1"))])))
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.as_service_error().unwrap().code(),
+        Some("ValidationException")
+    );
+    assert_eq!(e.get("synthetic-items", key()).await.unwrap(), original);
+}
+
+#[tokio::test]
+async fn document_paths_allow_32_dereferences_and_reject_33() {
+    let e = Emulator::new().await;
+    e.table("synthetic-items", None).await;
+    for lists in [false, true] {
+        let nested = |mut value| {
+            for _ in 0..32 {
+                value = if lists {
+                    Av::L(vec![value])
+                } else {
+                    Av::M(map(&[("x", value)]))
+                };
+            }
+            value
+        };
+        e.client
+            .put_item()
+            .table_name("synthetic-items")
+            .set_item(Some(map(&[("pk", s("item-1")), ("doc", nested(n("1")))])))
+            .send()
+            .await
+            .unwrap();
+        let path = format!(
+            "doc{}",
+            if lists {
+                "[0]".repeat(32)
+            } else {
+                ".x".repeat(32)
+            }
+        );
+        e.client
+            .update_item()
+            .table_name("synthetic-items")
+            .set_key(Some(key()))
+            .update_expression(format!("SET {path} = :next"))
+            .condition_expression(format!("{path} = :old"))
+            .expression_attribute_values(":next", n("2"))
+            .expression_attribute_values(":old", n("1"))
+            .send()
+            .await
+            .unwrap();
+        let expected = map(&[("pk", s("item-1")), ("doc", nested(n("2")))]);
+        assert_eq!(e.get("synthetic-items", key()).await.unwrap(), expected);
+        let too_deep = format!("{path}{}", if lists { "[0]" } else { ".x" });
+        let error = e
+            .client
+            .delete_item()
+            .table_name("synthetic-items")
+            .set_key(Some(key()))
+            .condition_expression(format!("attribute_not_exists({too_deep})"))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_service_error().unwrap().code(),
+            Some("ValidationException")
+        );
+        assert_eq!(e.get("synthetic-items", key()).await.unwrap(), expected);
+    }
 }
 
 #[tokio::test]
@@ -899,6 +1131,53 @@ async fn numeric_query_comparisons_order_and_pages() {
         .unwrap();
     assert_eq!(remaining.count(), 3);
     assert!(remaining.items.is_none());
+}
+
+#[tokio::test]
+async fn query_accepts_reversed_key_comparison_operands() {
+    let e = Emulator::new().await;
+    e.table("synthetic-items", Some(ScalarAttributeType::N))
+        .await;
+    for (partition, sort) in [
+        ("item-1", "1"),
+        ("item-1", "2"),
+        ("item-1", "3"),
+        ("other", "2"),
+    ] {
+        e.client
+            .put_item()
+            .table_name("synthetic-items")
+            .set_item(Some(map(&[("pk", s(partition)), ("sk", n(sort))])))
+            .send()
+            .await
+            .unwrap();
+    }
+    for (condition, uses_sort, expected) in [
+        (":p = #pk", false, vec![n("1"), n("2"), n("3")]),
+        (":p = #pk AND :v = sk", true, vec![n("2")]),
+        (":p = #pk AND :v < sk", true, vec![n("3")]),
+        (":p = #pk AND :v <= sk", true, vec![n("2"), n("3")]),
+        (":p = #pk AND :v > sk", true, vec![n("1")]),
+        (":v >= sk AND :p = #pk", true, vec![n("1"), n("2")]),
+    ] {
+        let mut query = e
+            .client
+            .query()
+            .table_name("synthetic-items")
+            .key_condition_expression(condition)
+            .expression_attribute_names("#pk", "pk")
+            .expression_attribute_values(":p", s("item-1"));
+        if uses_sort {
+            query = query.expression_attribute_values(":v", n("2"));
+        }
+        let page = query.send().await.unwrap();
+        let actual = page
+            .items()
+            .iter()
+            .map(|item| item["sk"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "{condition}");
+    }
 }
 
 #[tokio::test]
