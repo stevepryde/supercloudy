@@ -241,6 +241,22 @@ impl Parser {
         self.end()?;
         Ok(c)
     }
+    pub fn projection(&mut self, s: &str) -> Result<Vec<Path>> {
+        self.start(s)?;
+        let mut paths: Vec<Path> = vec![self.path()?];
+        while self.eat(",") {
+            let path = self.path()?;
+            if paths
+                .iter()
+                .any(|p| p.starts_with(&path) || path.starts_with(p))
+            {
+                return Err(Error::validation("Overlapping projection paths"));
+            }
+            paths.push(path);
+        }
+        self.end()?;
+        Ok(paths)
+    }
     fn or(&mut self) -> Result<Condition> {
         let mut c = self.and()?;
         while self.eat("OR") {
