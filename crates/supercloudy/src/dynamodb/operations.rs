@@ -169,7 +169,12 @@ pub(crate) fn write(db: &mut Database, op: &str, r: &Request) -> Result<Json> {
         "DeleteItem" => None,
         "UpdateItem" => {
             let base = old.as_ref().unwrap_or(&input);
-            Some(apply_updates(base, &actions)?)
+            let item = apply_updates(base, &actions)?;
+            if old.is_none() && actions.iter().all(|a| a.kind == "REMOVE") {
+                None
+            } else {
+                Some(item)
+            }
         }
         _ => unreachable!(),
     };
@@ -198,31 +203,58 @@ pub(crate) fn write(db: &mut Database, op: &str, r: &Request) -> Result<Json> {
     Ok(response)
 }
 fn updated_attributes(item: &Item, actions: &[Action]) -> Item {
-    let mut selected = Item::new();
-    for action in actions
+    let paths = actions
         .iter()
-        .filter(|a| super::expressions::get_path(item, &a.path).is_some())
-    {
-        copy_updated_map_path(item, &mut selected, &action.path);
-    }
-    selected
+        .map(|a| a.path.as_slice())
+        .collect::<Vec<_>>();
+    updated_map(item, &paths)
 }
-fn copy_updated_map_path(source: &Item, selected: &mut Item, path: &[Segment]) {
-    let Some((Segment::Name(name), tail)) = path.split_first() else {
-        return;
-    };
-    let Some(value) = source.get(name) else {
-        return;
-    };
-    if let (Value::M(children), [Segment::Name(_), ..]) = (value, tail) {
-        let projected = selected
-            .entry(name.clone())
-            .or_insert_with(|| Value::M(Item::new()));
-        if let Value::M(projected) = projected {
-            copy_updated_map_path(children, projected, tail);
+fn updated_map(item: &Item, paths: &[&[Segment]]) -> Item {
+    item.iter()
+        .filter_map(|(name, value)| {
+            let tails = paths
+                .iter()
+                .filter_map(|path| match path.split_first() {
+                    Some((Segment::Name(n), tail)) if n == name => Some(tail),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            updated_value(value, &tails).map(|value| (name.clone(), value))
+        })
+        .collect()
+}
+fn updated_value(value: &Value, paths: &[&[Segment]]) -> Option<Value> {
+    if paths.is_empty() {
+        return None;
+    }
+    if paths.iter().any(|path| path.is_empty()) {
+        return Some(value.clone());
+    }
+    match value {
+        Value::M(item) => {
+            let selected = updated_map(item, paths);
+            (!selected.is_empty()).then_some(Value::M(selected))
         }
-    } else {
-        selected.insert(name.clone(), value.clone());
+        Value::L(values) => {
+            // Select by source index before compacting, so multiple paths into
+            // one element merge and expression order cannot reorder the list.
+            let selected = values
+                .iter()
+                .enumerate()
+                .filter_map(|(index, value)| {
+                    let tails = paths
+                        .iter()
+                        .filter_map(|path| match path.split_first() {
+                            Some((Segment::Index(i), tail)) if *i == index => Some(tail),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    updated_value(value, &tails)
+                })
+                .collect::<Vec<_>>();
+            (!selected.is_empty()).then_some(Value::L(selected))
+        }
+        _ => None,
     }
 }
 fn create_table(db: &mut Database, r: &Request) -> Result<Json> {

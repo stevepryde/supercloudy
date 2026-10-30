@@ -1,6 +1,6 @@
 use super::error::{Error, Result};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use bigdecimal::{BigDecimal, Zero};
+use bigdecimal::{BigDecimal, Signed, Zero};
 use serde_json::{Value as Json, json};
 use std::{
     cmp::Ordering,
@@ -226,7 +226,7 @@ impl Value {
     }
 }
 fn number_size_bytes(n: &BigDecimal) -> usize {
-    n.normalized().digits().div_ceil(2) as usize + 1
+    n.normalized().digits().div_ceil(2) as usize + 1 + usize::from(n.is_negative())
 }
 pub(crate) fn item_size_bytes(item: &Item) -> usize {
     item.iter().map(|(k, v)| k.len() + v.size_bytes()).sum()

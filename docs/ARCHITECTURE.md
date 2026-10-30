@@ -77,7 +77,8 @@ and [DynamoDB constraints](https://docs.aws.amazon.com/amazondynamodb/latest/dev
 CreateTable validates simple/composite schemas; tables become active immediately.
 DescribeTable returns metadata. DeleteTable removes a table and its items atomically.
 GetItem omits `Item` for a missing item. PutItem replaces the complete item.
-UpdateItem can create an absent item using its supplied key. DeleteItem of an
+UpdateItem can create an absent item using its supplied key; a REMOVE-only
+update leaves an absent item absent. DeleteItem of an
 absent item succeeds unless a condition fails. PutItem and UpdateItem reject
 candidate items larger than 400 KiB with ValidationException before committing.
 Item size counts UTF-8 attribute names and strings, decoded binary bytes, scalar
@@ -109,7 +110,9 @@ UpdateItem also supports `ALL_NEW`, `UPDATED_OLD`, and `UPDATED_NEW`.
 `ReturnValuesOnConditionCheckFailure` is excluded.
 UPDATED modes select attributes whose exact touched path exists in the chosen
 image; nested map paths return only the selected leaves within their enclosing
-maps, omitting untouched siblings. Selected lists retain their complete value.
+maps, omitting untouched siblings. Selected list elements are compacted in source
+index order, selecting only touched paths within nested maps and lists. Updating
+an entire map or list returns its complete value.
 Condition functions treat nonmatching stored types as false or undefined, while invalid
 literal operand types are rejected. String `size` follows UTF-16 code units.
 

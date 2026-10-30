@@ -693,6 +693,66 @@ async fn item_size_limit_rejects_oversized_puts_and_updates_atomically() {
 }
 
 #[tokio::test]
+async fn negative_numbers_and_number_sets_respect_the_item_size_boundary() {
+    let e = Emulator::new().await;
+    e.table("synthetic-items", None).await;
+    // Names and key cost 21 bytes. -1 costs 3 bytes; {-1, -12} costs 6.
+    for (number, payload_len) in [
+        (n("-1"), 409_576),
+        (Av::Ns(vec!["-1".into(), "-12".into()]), 409_573),
+    ] {
+        let item = map(&[
+            ("pk", s("item-1")),
+            ("number", number.clone()),
+            ("payload", Av::B(Blob::new(vec![0; payload_len]))),
+        ]);
+        e.client
+            .put_item()
+            .table_name("synthetic-items")
+            .set_item(Some(item))
+            .send()
+            .await
+            .unwrap();
+        let original = e.get("synthetic-items", key()).await.unwrap();
+
+        let oversized_payload = Av::B(Blob::new(vec![0; payload_len + 1]));
+        let err = e
+            .client
+            .put_item()
+            .table_name("synthetic-items")
+            .set_item(Some(map(&[
+                ("pk", s("item-1")),
+                ("number", number),
+                ("payload", oversized_payload.clone()),
+            ])))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.as_service_error().unwrap().code(),
+            Some("ValidationException")
+        );
+        assert_eq!(e.get("synthetic-items", key()).await.unwrap(), original);
+
+        let err = e
+            .client
+            .update_item()
+            .table_name("synthetic-items")
+            .set_key(Some(key()))
+            .update_expression("SET payload = :v")
+            .expression_attribute_values(":v", oversized_payload)
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.as_service_error().unwrap().code(),
+            Some("ValidationException")
+        );
+        assert_eq!(e.get("synthetic-items", key()).await.unwrap(), original);
+    }
+}
+
+#[tokio::test]
 async fn numeric_query_comparisons_order_and_pages() {
     let e = Emulator::new().await;
     e.table("synthetic-items", Some(ScalarAttributeType::N))
@@ -1140,6 +1200,127 @@ async fn list_descendants_use_original_indices_before_sibling_removals() {
 }
 
 #[tokio::test]
+async fn updated_list_return_values_compact_elements_and_select_nested_paths() {
+    let e = Emulator::new().await;
+    e.table("synthetic-items", None).await;
+    let numbers = Av::L(vec![n("10"), n("20"), n("30")]);
+    for (expression, values, original, expected_old, expected_new) in [
+        (
+            "SET entries[1] = :v",
+            map(&[(":v", n("99"))]),
+            numbers.clone(),
+            Av::L(vec![n("20")]),
+            Av::L(vec![n("99")]),
+        ),
+        (
+            "SET entries[2] = :v, entries[0] = :w",
+            map(&[(":v", n("99")), (":w", n("88"))]),
+            numbers,
+            Av::L(vec![n("10"), n("30")]),
+            Av::L(vec![n("88"), n("99")]),
+        ),
+        (
+            "SET entries[1].x = :v, entries[0].y = :w, entries[1].y = :w",
+            map(&[(":v", n("99")), (":w", n("88"))]),
+            Av::L(vec![
+                Av::M(map(&[("x", n("10")), ("y", n("20"))])),
+                Av::M(map(&[("x", n("30")), ("y", n("40")), ("keep", s("yes"))])),
+                Av::M(map(&[("keep", s("untouched"))])),
+            ]),
+            Av::L(vec![
+                Av::M(map(&[("y", n("20"))])),
+                Av::M(map(&[("x", n("30")), ("y", n("40"))])),
+            ]),
+            Av::L(vec![
+                Av::M(map(&[("y", n("88"))])),
+                Av::M(map(&[("x", n("99")), ("y", n("88"))])),
+            ]),
+        ),
+    ] {
+        for (mode, expected) in [
+            (ReturnValue::UpdatedOld, expected_old),
+            (ReturnValue::UpdatedNew, expected_new),
+        ] {
+            e.client
+                .put_item()
+                .table_name("synthetic-items")
+                .set_item(Some(map(&[
+                    ("pk", s("item-1")),
+                    ("entries", original.clone()),
+                ])))
+                .send()
+                .await
+                .unwrap();
+            let got = e
+                .client
+                .update_item()
+                .table_name("synthetic-items")
+                .set_key(Some(key()))
+                .update_expression(expression)
+                .set_expression_attribute_values(Some(values.clone()))
+                .return_values(mode)
+                .send()
+                .await
+                .unwrap()
+                .attributes
+                .unwrap();
+            assert_eq!(got, map(&[("entries", expected)]), "{expression}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn remove_only_update_leaves_a_missing_item_absent() {
+    let e = Emulator::new().await;
+    e.table("synthetic-items", None).await;
+    for mode in [
+        ReturnValue::None,
+        ReturnValue::AllOld,
+        ReturnValue::AllNew,
+        ReturnValue::UpdatedOld,
+        ReturnValue::UpdatedNew,
+    ] {
+        let got = e
+            .client
+            .update_item()
+            .table_name("synthetic-items")
+            .set_key(Some(key()))
+            .update_expression("REMOVE absent, another_missing")
+            .return_values(mode)
+            .send()
+            .await
+            .unwrap();
+        assert!(got.attributes.is_none());
+        assert!(e.get("synthetic-items", key()).await.is_none());
+    }
+    e.client
+        .update_item()
+        .table_name("synthetic-items")
+        .set_key(Some(key()))
+        .update_expression("SET fresh = :v REMOVE absent")
+        .expression_attribute_values(":v", n("1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        e.get("synthetic-items", key()).await.unwrap(),
+        map(&[("pk", s("item-1")), ("fresh", n("1"))])
+    );
+    let got = e
+        .client
+        .update_item()
+        .table_name("synthetic-items")
+        .set_key(Some(key()))
+        .update_expression("REMOVE fresh")
+        .return_values(ReturnValue::AllNew)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.attributes, Some(key()));
+    assert_eq!(e.get("synthetic-items", key()).await, Some(key()));
+}
+
+#[tokio::test]
 async fn nested_return_values_select_only_paths_present_in_the_image() {
     let e = Emulator::new().await;
     e.table("synthetic-items", None).await;
@@ -1236,7 +1417,7 @@ async fn nested_return_values_select_only_paths_present_in_the_image() {
         .unwrap()
         .attributes
         .unwrap();
-    assert_eq!(new, map(&[("entries", Av::L(vec![s("a"), s("c")]))]));
+    assert_eq!(new, map(&[("entries", Av::L(vec![s("c")]))]));
     let got = e.get("synthetic-items", key()).await.unwrap();
     assert_eq!(
         got["doc"],
