@@ -1,0 +1,18 @@
+[workspace]
+members = ["crates/supercloudy"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/stevepryde/supercloudy"
+
+[workspace.dependencies]
+base64 = "0.22"
+bigdecimal = "0.4"
+serde = { version = "1", features = ["derive"] }
+axum = "0.8.9"
+clap = { version = "4.6.7", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
