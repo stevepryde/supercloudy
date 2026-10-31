@@ -321,6 +321,8 @@ reserved unaliased words, invalid types, overlapping update paths, and key
 mutations are rejected. Attribute names cannot be empty, including within maps.
 Document paths allow up to 32 dereference operators (dots or list indices),
 excluding the root attribute name.
+Condition grouping and `NOT` share a maximum recursion depth of 32, preventing
+mixed nesting from resetting the parser's stack bound.
 
 Conditions support comparisons, inclusive `BETWEEN`, `IN`, `AND`, `OR`, `NOT`,
 parentheses, `attribute_exists`, `attribute_not_exists`, `attribute_type`,

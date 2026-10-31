@@ -8,6 +8,9 @@ mod storage;
 mod transactions;
 mod value;
 
+#[cfg(test)]
+mod properties;
+
 use error::{Error, Result};
 use faults::{Effect, Faults};
 use serde_json::Value;
