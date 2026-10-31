@@ -200,6 +200,12 @@ async fn transactions_stage_all_actions_and_return_ordered_cancellation_images()
         failure.cancellation_reasons()[2].item().unwrap()["revision"],
         n("1")
     );
+    assert_eq!(failure.cancellation_reasons()[0].message(), None);
+    assert_eq!(failure.cancellation_reasons()[1].message(), None);
+    assert_eq!(
+        failure.cancellation_reasons()[2].message(),
+        Some("The conditional request failed")
+    );
     assert_eq!(
         e.get("synthetic-ledger", "a").await.unwrap()["revision"],
         n("1")

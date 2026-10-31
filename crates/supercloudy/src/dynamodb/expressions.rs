@@ -7,6 +7,9 @@ use std::{
     collections::{BTreeMap, BTreeSet},
 };
 
+#[cfg(test)]
+mod properties;
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Segment {
     Name(String),
@@ -237,7 +240,7 @@ impl Parser {
     }
     pub fn condition(&mut self, s: &str) -> Result<Condition> {
         self.start(s)?;
-        let c = self.or()?;
+        let c = self.or(0)?;
         self.end()?;
         Ok(c)
     }
@@ -257,17 +260,17 @@ impl Parser {
         self.end()?;
         Ok(paths)
     }
-    fn or(&mut self) -> Result<Condition> {
-        let mut c = self.and()?;
+    fn or(&mut self, depth: usize) -> Result<Condition> {
+        let mut c = self.and(depth)?;
         while self.eat("OR") {
-            c = Condition::Or(Box::new(c), Box::new(self.and()?));
+            c = Condition::Or(Box::new(c), Box::new(self.and(depth)?));
         }
         Ok(c)
     }
-    fn and(&mut self) -> Result<Condition> {
-        let mut c = self.unary(0)?;
+    fn and(&mut self, depth: usize) -> Result<Condition> {
+        let mut c = self.unary(depth)?;
         while self.eat("AND") {
-            c = Condition::And(Box::new(c), Box::new(self.unary(0)?));
+            c = Condition::And(Box::new(c), Box::new(self.unary(depth)?));
         }
         Ok(c)
     }
@@ -279,7 +282,9 @@ impl Parser {
             return Ok(Condition::Not(Box::new(self.unary(depth + 1)?)));
         }
         if self.eat("(") {
-            let c = self.or()?;
+            // Grouping must share the NOT recursion budget: resetting it here
+            // permits hundreds of recursive calls within the 4096-byte limit.
+            let c = self.or(depth + 1)?;
             self.expect(")")?;
             return Ok(c);
         }

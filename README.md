@@ -386,6 +386,28 @@ Behavior tests use `aws-sdk-dynamodb`, `aws-sdk-s3`, `aws-sdk-ssm`, `aws-sdk-lam
 fixtures, and credentials `test`. Each test spawns its own server on a random
 loopback port. No cloud account, Docker, or Python is required.
 
+Property tests use `proptest` as a development dependency. DynamoDB and S3
+operation sequences run through Rust SDK clients on real loopback listeners and
+compare responses and stored state with plain in-test maps. In-process properties
+exercise private expression/XML/JSON parsers and database snapshot/lock behavior.
+The snapshot properties race transactional writers and readers on separate runtime
+workers; each page must contain one committed revision.
+
+SDK sequence/range and lock properties default to 32 cases each; parser properties
+default to 96. Each suite has a fixed RNG seed for reproducible ordinary runs.
+For a deeper run, or a different reproducible seed:
+
+```sh
+PROPTEST_CASES=1000 cargo test --lib --test dynamodb_properties --test s3_properties
+PROPTEST_CASES=1000 PROPTEST_RNG_SEED=208 cargo test --lib --test dynamodb_properties --test s3_properties
+```
+
+Failures shrink to a smaller input and persist seeds in
+`crates/supercloudy/proptest-regressions/` or the corresponding
+`tests/*.proptest-regressions` file. Keep regression seeds when fixing a real bug.
+Generated parser inputs include structured nesting as well as arbitrary text and
+bytes; the mixed NOT/grouping regression covers a previously aborting stack overflow.
+
 The secret scan checks regular files including ignored files, the Git index,
 and every commit reachable from local Git refs. It excludes `.git` metadata and
 `target` directories, rejects credential filenames and common secret formats,

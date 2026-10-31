@@ -2,6 +2,9 @@ pub(crate) mod faults;
 mod http;
 mod protocol;
 
+#[cfg(test)]
+mod properties;
+
 use crate::fault_config::Faults;
 use axum::{body::to_bytes, extract::Request, http::Method, response::Response};
 use base64::{

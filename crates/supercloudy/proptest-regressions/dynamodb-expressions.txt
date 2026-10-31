@@ -1,0 +1,5 @@
+# Mixed NOT/group nesting previously reset recursion depth and aborted the process.
+# The original deterministic reproducer used 30 groups with 30 NOTs per group.
+# The isolated no-abort property recovered this replayable seed from that defect;
+# shrink results can vary with platform stack size. Keep the deterministic test too.
+cc 4cae2354eccfb798940351e1ca6939e4badb3f5bcd6466a5029e11d1c2fef635 # shrinks to groups = 9, nots = 21
