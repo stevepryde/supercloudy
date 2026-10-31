@@ -1,11 +1,13 @@
 # supercloudy architecture
 
-Status: in-memory DynamoDB and S3 behavior milestones.
+Status: in-memory DynamoDB, S3, SSM GetParameter and local Responses fixtures.
 
 ## Scope
 
 supercloudy is an independent Rust process serving subsets of DynamoDB's JSON
-wire protocol and S3's REST/XML protocol on one listener. Consumers use ordinary AWS SDKs against a local endpoint.
+wire protocol, S3's REST/XML protocol, SSM's JSON 1.1 protocol and a generic
+OpenAI Responses stub on one listener. Consumers use ordinary AWS SDKs or HTTP
+clients against a local endpoint.
 There are no consumer dependencies, persistent storage, cloud calls, or cloud
 credentials. Fixtures and examples are synthetic; dummy credentials are `test`.
 
@@ -27,7 +29,11 @@ Every crate inherits the workspace MIT license. Cargo.lock is retained.
 | `s3` | Atomic in-memory bucket/object operations, ranges, checksums, listing |
 | `s3/http` | URI/header decoding, presign expiry, bounded aws-chunked payload decoding |
 | `s3/protocol` | REST/XML responses, HTTP metadata and errors |
-| `faults` | Public rule schema, common ordinal validation, scheduling and per-instance counters |
+| `faults` | Shared ordinal validation, ordered scheduling and per-instance counters only |
+| `fault_config` | Unchanged public AWS fault schema and assembly of service validators |
+| `ssm` | Immutable synthetic parameters, GetParameter validation and JSON 1.1 adapter |
+| `openai` | Immutable Responses fixtures, request validation and HTTP adapter |
+| `openai/faults` | Stub rule schema, validation, format matching and effect rendering |
 | `s3/faults` | S3 rule validation, bucket/key matching and error mapping |
 | `protocol` | AWS JSON response envelope and request IDs |
 | `dynamodb/api` | Request decoding structures |
@@ -49,38 +55,38 @@ AWS SDKs and reqwest are dev dependencies.
 
 ## Service routing and S3
 
-Any `X-Amz-Target` owns dispatch before REST hints, preserving DynamoDB protocol
-errors. Without it, explicit SigV4 signing scope selects S3 or rejects unsupported
-services. A `<bucket>.localhost` authority then selects S3, followed by non-root
-path-style requests. Unsigned root requests retain the unknown-operation envelope.
-Conflicting or malformed routing information fails before execution. No registry,
-plugin trait, or speculative service implementation is introduced.
+Classification inspects headers, authority, method and raw URI **before reading
+any body**, with this precedence:
 
-Classification inspects the original authority/Host, method, raw path/query and
-target without collecting the body. Target dispatch has highest precedence, even
-on a bucket host or with conflicting signing hints. Unknown DynamoDB operations
-remain JSON unknown-operation errors. Without a target, conflicting or malformed
-explicit signing scopes fail; an unsupported signing service cannot fall through
-to S3. Bucket hosts preserve every object path, including service-looking keys.
-Only the final non-root path fallback is weak path-style S3 ownership.
+1. Any `X-Amz-Target` owns dispatch. Exact `AmazonSSM.` and `DynamoDB_20120810.`
+   families own unsupported operations and wrong method/path errors; supported
+   operations require `POST /`. SSM uses its own JSON 1.1 errors. Duplicate or
+   malformed targets and unknown families retain generic JSON unknown-operation
+   errors. Targets win even on bucket hosts or with conflicting signing hints.
+2. Without a target, explicit SigV4 scope owns dispatch: `s3`, `ssm`, `dynamodb`.
+   SSM/DynamoDB without their target return their own unknown-operation errors.
+   Malformed/conflicting scopes and unsupported services fail before execution.
+   Non-SigV4 Authorization is deferred to the selected service.
+3. A `<bucket>.localhost` authority owns every S3 object path.
+4. Enabled service reservations on the base host precede weak path-style S3.
+5. Remaining non-root paths select S3; unsigned root retains the generic error.
 
-Future reservations below are documentation only. They become active with their
-service implementations; current unsigned non-root paths still reach S3.
-
-| Future service | Reserved selector on the shared base host | Precedence when activated |
+| Service | Reserved selector on the shared base host | Status and precedence |
 | --- | --- | --- |
-| SSM | `POST /` with `X-Amz-Target: AmazonSSM.<operation>` (its own JSON 1.1 envelope) | Target dispatch, before signing/REST hints; unknown operations remain SSM errors. |
-| Lambda | Raw `/2015-03-31/functions` and `/2015-03-31/functions/...`, all methods; invocation is `POST /2015-03-31/functions/{function}/invocations` | After explicit AWS selectors and bucket hosts, before configured HTTP stubs and path-style S3; unsupported methods/operations remain Lambda errors. |
-| Plain HTTP stubs | Only explicitly configured exact method/raw-path pairs, for example `GET /certificates/synthetic.pem`; no implicit catch-all or prefix reservation | After AWS selectors, bucket hosts and Lambda's reserved paths, before path-style S3. Query handling belongs to the selected stub. |
+| SSM | `X-Amz-Target: AmazonSSM.<operation>`; operations require `POST /` | Active even with no parameters. Target family wins before signing/REST hints; `ssm` signing scope also owns missing-target errors. |
+| Responses stub | Exactly `POST /v1/responses`, ignoring query parameters | Active only with `--openai-fixtures` or `ServiceConfig.openai = Some(...)`, including empty fixtures. After explicit AWS selectors and bucket hosts; before path-style S3. |
+| Lambda | Raw `/2015-03-31/functions` and `/2015-03-31/functions/...`, all methods; invocation is `POST /2015-03-31/functions/{function}/invocations` | Future, inactive. After AWS selectors and bucket hosts, before HTTP stubs and path-style S3. |
+| Other plain HTTP stubs | Explicit exact method/raw-path pairs, such as `GET /certificates/synthetic.pem` | Future, inactive. After AWS selectors, bucket hosts and future Lambda paths, before path-style S3. |
 
-Future SSM/Lambda signing scopes own their service just as S3's scope does; a
-missing required target is a service error. Explicit S3 signing scopes and bucket
-hosts keep S3 ownership ahead of future path reservations, while targets still
-win. Reservations match raw paths without percent decoding or normalization.
-On the shared base host, future Lambda paths collide with a path-style S3 bucket
-named `2015-03-31`, and configured HTTP pairs can collide with bucket/key paths.
-Use `<bucket>.localhost` addressing for those S3 keys (or an explicit S3 signing
-scope). No SSM, Lambda or plain HTTP stub handler/configuration is added here.
+Reservations match raw paths without percent decoding or normalization. No prefix,
+trailing-slash, other-method or percent-encoded Responses reservation is implied.
+When enabled, unsigned base-host `POST /v1/responses` takes precedence over the S3
+interpretation (bucket `v1`, key `responses`); `v1` is itself below S3's minimum
+bucket-name length. Explicit S3 signing retains S3's XML error on this path.
+Valid bucket-host addressing preserves service-looking object keys. GET/PUT
+`/v1/responses` and requests with the stub disabled retain S3 ownership.
+Future Lambda paths collide with bucket `2015-03-31`; use bucket hosts or S3
+signing to preserve S3 ownership. No registry or service plugin trait is used.
 
 S3 owns a separate ordered bucket/object map and lock. Put, Copy (including across
 buckets), and Delete validate before publication under that lock. Reads clone
@@ -89,7 +95,7 @@ Faults share one ordered scheduler while each service owns eligibility and error
 
 The detailed S3 protocol contract, addressing, supported operations, checksum and
 presign semantics, and extension points are recorded in the retained
-[service routing design](plans/service-routing-s3.md). Both services remain entirely
+[service routing design](plans/service-routing-s3.md). All services remain entirely
 in memory. S3 does not authenticate signatures, perform encryption, or contact KMS.
 Virtual-host addressing requires the client's resolver to reach wildcard localhost;
 HTTP routing cannot supply DNS.
@@ -103,6 +109,47 @@ framing/trailers for a maximum-size object; more framing is rejected too.
 Overflow returns S3 `EntityTooLarge` before fault selection or publication.
 Collection and decoding finish before storage locks. DynamoDB retains its
 independent 32 MiB JSON body policy.
+
+## SSM and Responses fixtures
+
+`up --ssm-parameters <json-file>` seeds immutable `String`, `StringList` and
+`SecureString` parameters; omission means an empty store. `AmazonSSM.GetParameter`
+accepts a string `Name` (surrounding whitespace trimmed) and optional boolean
+`WithDecryption`. Names use ASCII letters/digits and `/_.-`, at most 2048 bytes;
+ARNs, labels and version selectors are unsupported. Missing names return HTTP 400
+`ParameterNotFound`. SecureString returns configured synthetic `encrypted_value`
+unless WithDecryption is true, then `value`; other types ignore the flag.
+Responses use `application/x-amz-json-1.1`, unqualified error codes and
+`x-amzn-RequestId`. Version is 1, DataType is text. No writes, IAM or KMS parity.
+SSM collection is bounded at 64 KiB; overflow is `SerializationException`.
+
+`up --openai-fixtures <json-file>` enables immutable Responses fixtures. A single
+nonempty bearer is required before body collection; missing, wrong-scheme, empty
+or duplicate authorization returns 401. Tokens are never validated or forwarded.
+Requests require model, input and `text.format` with `type:json_schema`, name and
+an object schema. Input may be a string or nonempty messages with supported roles
+and text/content blocks. Text, image and file blocks are accepted; image/file data
+is opaque and never fetched or decoded. Streaming, background execution and tools
+are unsupported. JSON collection is bounded at 32 MiB of actual wire bytes,
+including base64 content, with HTTP 413 `request_too_large` on overflow.
+
+Fixtures match exact format name and an optional case-sensitive substring in an
+individual input text entry; first match wins. Message content strings also count
+as text. Schema strings, image/file fields and serialized JSON are never searched.
+No-match returns HTTP 400 `fixture_not_found`. JSON output is serialized once into
+exactly one assistant message's `output_text` entry in a completed Responses
+envelope. Every stub response, including errors, has a fresh `x-request-id`.
+No schema execution, consumer parser validation, persistence or outbound network
+operations occur. Synthetic config formats and examples are in the retained
+[SSM and Responses design](plans/ssm-and-openai-stub.md).
+
+Stub-local ordered faults support 429, 500 and HTTP 200 incomplete envelopes.
+They share scheduling mechanics with AWS faults while retaining their own schema
+in `openai/faults.rs`; `FaultRule`/`FaultEffect` remain compatible. Selection occurs
+only after auth, bounded collection, decoding, validation and fixture lookup.
+All matching counters advance, first eligible rule wins, retries count anew,
+and instances/services have independent counters. Locks are released before
+response construction. There are no SSM fault rules in this slice.
 
 ## HTTP and encoding
 

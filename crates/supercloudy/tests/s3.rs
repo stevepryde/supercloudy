@@ -943,7 +943,16 @@ async fn malformed_requests_fail_before_overwriting_object_and_attributes() {
             400,
         ),
     ] {
-        let mut request = e.http.put(e.url("protected")).body("overwrite");
+        // Valid framing isolates decoded-length mismatch from parser failures.
+        let body = if headers
+            .iter()
+            .any(|(name, _)| *name == "x-amz-decoded-content-length")
+        {
+            "3\r\nabc\r\n0\r\n\r\n"
+        } else {
+            "overwrite"
+        };
+        let mut request = e.http.put(e.url("protected")).body(body);
         for (name, value) in headers {
             request = request.header(name, value);
         }
@@ -1034,22 +1043,22 @@ async fn aws_chunked_decoding_checksum_trailers_and_rejected_framing() {
         .send().await);
     assert_eq!(response.status(), 200);
     assert_eq!(e.bytes("chunked").await, b"123456789");
-    for (body, decoded_length) in [
-        ("4\r\nabc", "3"),
-        ("3\r\nabc\r\n0\r\n\r\n", "4"),
-        ("3\r\nabc\r\n0\r\n\r\n", "3"),
-        ("g\r\nabc\r\n0\r\n\r\n", "3"),
+    for (body, decoded_length, trailer) in [
+        ("4\r\nabc", "3", true),
+        // No announced trailer: only the decoded length is wrong.
+        ("3\r\nabc\r\n0\r\n\r\n", "4", false),
+        ("3\r\nabc\r\n0\r\n\r\n", "3", true),
+        ("g\r\nabc\r\n0\r\n\r\n", "3", true),
     ] {
-        let response = success(
-            e.http
-                .put(e.url("chunked"))
-                .header("content-encoding", "aws-chunked")
-                .header("x-amz-decoded-content-length", decoded_length)
-                .header("x-amz-trailer", "x-amz-checksum-crc32")
-                .body(body)
-                .send()
-                .await,
-        );
+        let mut request = e
+            .http
+            .put(e.url("chunked"))
+            .header("content-encoding", "aws-chunked")
+            .header("x-amz-decoded-content-length", decoded_length);
+        if trailer {
+            request = request.header("x-amz-trailer", "x-amz-checksum-crc32");
+        }
+        let response = success(request.body(body).send().await);
         assert_eq!(response.status(), 400);
         assert_eq!(e.bytes("chunked").await, b"123456789");
     }
@@ -1267,4 +1276,58 @@ async fn unsupported_copy_encryption_and_malformed_bucket_xml_preserve_state() {
             200
         );
     }
+}
+
+#[tokio::test]
+async fn size_rejection_preserves_the_next_s3_fault() {
+    let faults = serde_json::from_value(serde_json::json!({"rules":[{
+        "service":"s3","operation":"PutObject","bucket":BUCKET,"key":"protected",
+        "first_request":2,"repeat":1,"effect":{"type":"throttle"}
+    }]}))
+    .unwrap();
+    let e = Emulator::with_config(supercloudy::server::Config {
+        buckets: vec![BUCKET.into()],
+        faults,
+    })
+    .await;
+    success(
+        e.http
+            .put(e.url("protected"))
+            .header("content-type", "text/plain")
+            .header("x-amz-meta-fixture", "original")
+            .body("original")
+            .send()
+            .await,
+    );
+    let response = success(
+        e.http
+            .put(e.url("protected"))
+            .body(vec![0; 64 * 1024 * 1024 + 1])
+            .send()
+            .await,
+    );
+    assert_eq!(response.status(), 400);
+    assert!(success(response.text().await).contains("<Code>EntityTooLarge</Code>"));
+    let response = success(e.http.put(e.url("protected")).body("rejected").send().await);
+    assert_eq!(response.status(), 503);
+    assert!(success(response.text().await).contains("<Code>SlowDown</Code>"));
+    assert_eq!(e.bytes("protected").await, b"original");
+    let head = success(
+        e.client
+            .head_object()
+            .bucket(BUCKET)
+            .key("protected")
+            .send()
+            .await,
+    );
+    assert_eq!(head.content_type(), Some("text/plain"));
+    assert_eq!(
+        head.metadata().unwrap().get("fixture").map(String::as_str),
+        Some("original")
+    );
+    assert_eq!(
+        success(e.http.put(e.url("protected")).body("accepted").send().await).status(),
+        200
+    );
+    assert_eq!(e.bytes("protected").await, b"accepted");
 }

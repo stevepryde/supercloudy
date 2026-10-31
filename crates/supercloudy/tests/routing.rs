@@ -37,7 +37,10 @@ fn auth(service: &str) -> String {
 #[tokio::test]
 async fn unknown_targets_respond_before_body_arrives_despite_s3_hints() {
     let e = emulator(json!({"rules":[]})).await;
-    for target in ["DynamoDB_20120810.NotAnOperation", "AmazonSSM.GetParameter"] {
+    for target in [
+        "DynamoDB_20120810.NotAnOperation",
+        "UnimplementedService.GetParameter",
+    ] {
         let mut stream = TcpStream::connect(e.endpoint.strip_prefix("http://").unwrap())
             .await
             .unwrap();
@@ -76,7 +79,7 @@ async fn target_and_signing_scope_ownership_precede_rest_paths() {
             Some("DynamoDB_20120810.PutItem"),
             Some(auth("s3")),
         ),
-        ("POST", "/", Some("AmazonSSM.GetParameter"), None),
+        ("POST", "/", Some("UnimplementedService.GetParameter"), None),
         ("PUT", "/synthetic-bucket/key", None, Some(auth("lambda"))),
         ("PUT", "/synthetic-bucket/key", None, Some(auth("dynamodb"))),
         ("POST", "/", None, None),

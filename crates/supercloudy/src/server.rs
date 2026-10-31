@@ -1,9 +1,9 @@
 use crate::{
     dynamodb,
-    faults::Faults,
-    protocol,
+    fault_config::Faults,
+    openai, protocol,
     routing::{self, Route},
-    s3,
+    s3, ssm,
 };
 use axum::{
     Router,
@@ -24,6 +24,17 @@ pub struct Config {
     pub faults: FaultConfig,
     pub buckets: Vec<String>,
 }
+/// Optional services on the existing listener. `Some` enables the Responses path,
+/// even with no fixtures. Parameters default to an empty immutable store.
+#[derive(Clone, Debug, Default)]
+pub struct ServiceConfig {
+    pub ssm: SsmConfig,
+    pub openai: Option<OpenAiConfig>,
+}
+pub use crate::openai::faults::{Effect as OpenAiFaultEffect, Rule as OpenAiFaultRule};
+pub use crate::openai::{Config as OpenAiConfig, Fixture};
+pub use crate::ssm::{Config as SsmConfig, Parameter, ParameterType};
+
 #[derive(Debug)]
 pub struct ConfigError(String);
 impl fmt::Display for ConfigError {
@@ -37,6 +48,8 @@ impl std::error::Error for ConfigError {}
 struct Services {
     dynamodb: dynamodb::Service,
     s3: s3::Service,
+    ssm: ssm::Service,
+    openai: Option<openai::Service>,
 }
 
 /// Construct an isolated in-memory emulator. Clones of this router share state.
@@ -47,22 +60,49 @@ pub fn router() -> Router {
 /// Construct an isolated emulator with explicit, validated deterministic faults.
 pub fn router_with_faults(config: FaultConfig) -> Result<Router, FaultConfigError> {
     let faults = Faults::new(config)?;
-    Ok(build(faults, Vec::new()).expect("empty bucket configuration is valid"))
+    Ok(build(faults, Vec::new(), ServiceConfig::default())
+        .expect("empty bucket configuration is valid"))
 }
 
 pub fn router_with_config(config: Config) -> Result<Router, ConfigError> {
-    let faults = Faults::new(config.faults).map_err(|e| ConfigError(e.to_string()))?;
-    build(faults, config.buckets)
+    router_with_services(config, ServiceConfig::default())
 }
-fn build(faults: Faults, buckets: Vec<String>) -> Result<Router, ConfigError> {
+
+pub fn router_with_services(
+    config: Config,
+    services: ServiceConfig,
+) -> Result<Router, ConfigError> {
+    let faults = Faults::new(config.faults).map_err(|e| ConfigError(e.to_string()))?;
+    build(faults, config.buckets, services)
+}
+fn build(
+    faults: Faults,
+    buckets: Vec<String>,
+    config: ServiceConfig,
+) -> Result<Router, ConfigError> {
     let services = Services {
         dynamodb: dynamodb::Service::with_scheduler(faults.clone()),
         s3: s3::Service::new(buckets, faults).map_err(ConfigError)?,
+        ssm: ssm::Service::new(config.ssm).map_err(ConfigError)?,
+        openai: config
+            .openai
+            .map(openai::Service::new)
+            .transpose()
+            .map_err(ConfigError)?,
     };
     Ok(Router::new().fallback(dispatch).with_state(services))
 }
 async fn dispatch(State(services): State<Services>, request: Request) -> Response {
-    let op = match routing::classify(&request) {
+    let op = match routing::classify(&request, services.openai.is_some()) {
+        Route::Ssm(op) => return services.ssm.dispatch(op.as_deref(), request).await,
+        Route::OpenAi => {
+            return services
+                .openai
+                .as_ref()
+                .expect("configured route")
+                .dispatch(request)
+                .await;
+        }
         Route::S3 => return services.s3.dispatch(request).await,
         Route::InvalidS3 => return s3::routing_error(&request),
         Route::Unknown => return protocol::unknown_operation(),

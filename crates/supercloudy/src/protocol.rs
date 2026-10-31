@@ -6,8 +6,11 @@ use axum::{
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+pub(crate) fn request_id() -> String {
+    NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed).to_string()
+}
 pub(crate) fn response(body: Value, status: StatusCode) -> Response {
-    let id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed).to_string();
+    let id = request_id();
     (
         status,
         [

@@ -1,4 +1,4 @@
-use crate::faults::{FaultEffect, FaultRule, Faults};
+use crate::fault_config::{FaultEffect, FaultRule, Faults};
 
 pub(crate) fn validate_rule(rule: &FaultRule) -> Result<(), &'static str> {
     if rule.table.is_some()

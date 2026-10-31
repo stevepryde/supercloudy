@@ -1,6 +1,8 @@
 use super::error::Error;
-pub(crate) use crate::faults::Faults;
-pub use crate::faults::{CancellationCode, FaultConfig, FaultConfigError, FaultEffect, FaultRule};
+pub(crate) use crate::fault_config::Faults;
+pub use crate::fault_config::{
+    CancellationCode, FaultConfig, FaultConfigError, FaultEffect, FaultRule,
+};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
