@@ -421,6 +421,12 @@ Enable the optional pre-commit hook with:
 git config core.hooksPath .githooks
 ```
 
+## CI
+
+Pushes to `main` and pull requests run formatting, Clippy, tests and the secret
+scan. Mutation tests run manually or weekly on Mondays at 03:23 UTC; they report a
+notice and skip until `scripts/mutants.sh` is available.
+
 ## License
 
 [MIT](LICENSE), Copyright (c) 2026 Steve Pryde.
