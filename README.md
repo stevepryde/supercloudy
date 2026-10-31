@@ -401,8 +401,8 @@ git config core.hooksPath .githooks
 
 ## CI
 
-Pushes and pull requests run formatting, Clippy, tests and the secret scan.
-Mutation tests run manually or weekly on Mondays at 03:23 UTC; they report a
+Pushes to `main` and pull requests run formatting, Clippy, tests and the secret
+scan. Mutation tests run manually or weekly on Mondays at 03:23 UTC; they report a
 notice and skip until `scripts/mutants.sh` is available.
 
 ## License
