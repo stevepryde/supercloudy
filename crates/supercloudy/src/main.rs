@@ -38,6 +38,9 @@ enum Command {
         /// Certificate cache lifetime in seconds (default 3600; enables Firebase).
         #[arg(long)]
         firebase_cert_max_age: Option<u32>,
+        /// JSON function mappings, concurrency, drain timeout and Invoke faults.
+        #[arg(long)]
+        lambda_functions: Option<PathBuf>,
     },
 }
 
@@ -54,6 +57,7 @@ async fn main() -> std::io::Result<()> {
                 firebase,
                 firebase_project_id,
                 firebase_cert_max_age,
+                lambda_functions,
             },
     } = Cli::parse();
     let faults = faults
@@ -72,24 +76,48 @@ async fn main() -> std::io::Result<()> {
             project_id: firebase_project_id,
             cert_max_age: firebase_cert_max_age.unwrap_or(3600),
         });
-    let router = supercloudy::server::router_with_services(
-        supercloudy::server::Config { faults, buckets },
-        supercloudy::server::ServiceConfig {
-            ssm,
-            openai,
-            firebase,
-        },
-    )
-    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let lambda = lambda_functions
+        .map(|path| load_json(path, "Lambda functions"))
+        .transpose()?;
+    let runtime = std::sync::Arc::new(
+        supercloudy::server::runtime_with_services(
+            supercloudy::server::Config { faults, buckets },
+            supercloudy::server::ServiceConfig {
+                ssm,
+                openai,
+                firebase,
+                lambda,
+            },
+        )
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
+    );
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     println!("Listening on http://{}", listener.local_addr()?);
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async {
-            if let Err(error) = tokio::signal::ctrl_c().await {
-                eprintln!("Unable to listen for Ctrl-C: {error}");
-            }
+    let draining = runtime.clone();
+    let result = axum::serve(listener, runtime.router())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            // Accepted handlers may still need this listener for storage calls.
+            draining.shutdown().await;
         })
-        .await
+        .await;
+    runtime.shutdown().await;
+    result
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("Unable to listen for termination");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn load_json<T: serde::de::DeserializeOwned>(path: PathBuf, kind: &str) -> std::io::Result<T> {

@@ -200,6 +200,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-lambda"
+version = "1.156.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54eb230a1a836e7aba150ce63a979960b7222c3e46f0ba9298ecf62987237662"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-eventstream",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.1",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.1.2",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-s3"
 version = "1.157.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2723,6 +2749,7 @@ name = "supercloudy"
 version = "0.1.0"
 dependencies = [
  "aws-sdk-dynamodb",
+ "aws-sdk-lambda",
  "aws-sdk-s3",
  "aws-sdk-ssm",
  "aws-smithy-http-client",

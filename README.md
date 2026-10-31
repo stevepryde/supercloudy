@@ -1,8 +1,8 @@
 # supercloudy
 
-An in-memory DynamoDB, S3 and SSM emulator with local OpenAI Responses and Firebase ID token stubs.
+An in-memory DynamoDB, S3, SSM and Lambda Invoke emulator with local OpenAI Responses and Firebase ID token stubs.
 Use ordinary AWS SDKs and HTTP clients against one loopback endpoint. No cloud
-account is needed; service handlers make no outbound network calls.
+account is needed. Lambda Invoke can forward to explicitly configured loopback HTTP targets; other services make no outbound network calls.
 
 ```sh
 cargo run -- up --port 8000 --bucket synthetic-images
@@ -126,13 +126,13 @@ independent JSON body limit remains 32 MiB.
 
 Routing selects service ownership before reading bodies: any `X-Amz-Target`,
 then explicit SigV4 scope, then `<bucket>.localhost`, then the enabled exact
-`POST /v1/responses` and Firebase certificate/mint reservations, then non-root
+Lambda paths, `POST /v1/responses` and Firebase certificate/mint reservations, then non-root
 path-style S3. SSM target errors
 use JSON 1.1; DynamoDB retains JSON 1.0. Unknown operations stay with their service.
 Malformed/conflicting signing scopes fail before execution. GET/PUT, encoded or
 trailing-slash Responses paths remain S3. Explicit S3 signing and valid bucket
 hosts retain S3 ownership of service-looking paths. The full reservation table,
-including future inactive Lambda paths, is in [ARCHITECTURE.md](docs/ARCHITECTURE.md).
+including Lambda paths, is in [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 To exercise a running server with synthetic data and dummy credentials:
 
@@ -266,6 +266,79 @@ parameters do not change reservations; wrong methods, trailing slashes and
 percent-encoded paths retain S3 ownership. Omitting all Firebase flags disables
 both reservations. See [the architecture contract](docs/ARCHITECTURE.md).
 
+## Local Lambda Invoke
+
+Load a function map with `--lambda-functions <json-file>`:
+
+```json
+{
+  "functions": {
+    "synthetic-echo": {"url":"http://127.0.0.1:9001/invoke"},
+    "synthetic-canned": {"response":"{\"ok\":true}"},
+    "synthetic-failure": {"response":"{\"errorMessage\":\"sample failure\"}","function_error":"Unhandled"}
+  },
+  "max_concurrency":16,
+  "shutdown_timeout_ms":5000,
+  "faults":[]
+}
+```
+
+```sh
+supercloudy up --port 8137 --lambda-functions .supercloudy/functions.json
+```
+
+Use an ordinary Lambda SDK with the emulator endpoint and credentials `test`.
+`POST /2015-03-31/functions/{name}/invocations` forwards the raw body by HTTP POST
+as `application/octet-stream`; the target must accept raw bytes. URLs must be
+loopback HTTP, without credentials or fragments. Proxies and redirects are
+disabled. Each forward has a 30-second timeout (5-second connect timeout).
+Canned `response` strings are returned as literal UTF-8 bytes.
+
+`RequestResponse` (default) returns 200 and the target body. A target
+`X-Amz-Function-Error` is preserved; a non-2xx target response supplies `Unhandled`
+when the header is absent. These are handler failures, still HTTP 200. Connection,
+timeout, truncated/oversized response failures are Invoke API errors (502
+`ServiceException`), without a function-error header. Unknown names return 404
+`ResourceNotFoundException`. `DryRun` returns 204 without contacting the target.
+This follows the [Invoke API status/function-error distinction](https://docs.aws.amazon.com/lambda/latest/api/API_Invoke.html).
+
+`Event` returns 202 only after reserving a concurrency slot and registering work
+in the runtime-owned task set. It returns before the target completes; disconnecting
+the caller does not cancel accepted work. The shared concurrency bound covers
+both invocation types; saturation returns 429 `TooManyRequestsException` without
+acceptance. There is no waiting queue, persistence or async retry simulation.
+Async handler/transport failures have no result channel and are not retried.
+RequestResponse payloads and all handler responses are limited to 6 MiB; Event
+payloads to 1 MiB. Bodies remain opaque, including non-JSON bytes. Query options,
+version/alias resolution, logs, IAM and management APIs are unsupported; map exact
+function names (including qualified names if needed).
+
+Ctrl-C or SIGTERM stops Lambda admission and drains accepted Events for
+`shutdown_timeout_ms` (default 5000) while the shared HTTP listener remains live
+for their DynamoDB/S3 calls. Remaining tasks are cancelled and joined, then HTTP
+acceptance stops and in-flight HTTP requests finish; state is discarded. Library hosts should keep
+`server::runtime_with_services(Config, ServiceConfig)` alive, serve
+`runtime.router()`, and call `runtime.shutdown().await` before closing the shared
+HTTP listener.
+`ServiceConfig.lambda = Some(...)` enables the base-host path reservation; a
+Lambda SigV4 scope always retains Lambda ownership. The router-only constructors
+remain available, but dropping a router cancels its owned work without a drain.
+
+Invoke faults use the same ordered scheduler as the other services. Configure
+`faults` in the function-map file, for example:
+
+```json
+{"functions":{"synthetic-worker":{"response":"{}"}},"faults":[{"function_name":"synthetic-worker","first_request":1,"repeat":1,"effect":"throttle"}]}
+```
+
+Optional `function_name` selects one function. Effects are `throttle` (429),
+`service_error` (500 `ServiceException`), and `function_error` (200 plus
+`Unhandled`, or an asynchronously discarded handler failure for Event). Counters
+advance after function/type/body validation and capacity reservation; unknown
+names, DryRun and capacity rejection do not consume them. First eligible rule
+wins, all matching counters advance, and instances are isolated. Use ignored
+`.supercloudy/` for local configuration and synthetic fixtures only.
+
 ## Deterministic faults
 
 Ordinary startup is fault-free. Explicitly load ordered rules to exercise retries:
@@ -309,7 +382,7 @@ cargo test --workspace --all-targets
 scripts/secret-scan.sh
 ```
 
-Behavior tests use `aws-sdk-dynamodb`, `aws-sdk-s3`, `aws-sdk-ssm`, and reqwest with local endpoints, synthetic
+Behavior tests use `aws-sdk-dynamodb`, `aws-sdk-s3`, `aws-sdk-ssm`, `aws-sdk-lambda`, and reqwest with local endpoints, synthetic
 fixtures, and credentials `test`. Each test spawns its own server on a random
 loopback port. No cloud account, Docker, or Python is required.
 

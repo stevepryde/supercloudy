@@ -51,6 +51,7 @@ impl Emulator {
                 faults: serde_json::from_value(json!({"rules":rules})).unwrap(),
             },
             ServiceConfig {
+                lambda: None,
                 firebase: None,
                 ssm: serde_json::from_value(parameters()).unwrap(),
                 openai: openai.map(|v| serde_json::from_value(v).unwrap()),
@@ -478,7 +479,7 @@ async fn service_ownership_raw_paths_enablement_and_shared_listener() {
             expected
         );
     }
-    for service in ["ssm", "dynamodb", "lambda"] {
+    for service in ["ssm", "dynamodb"] {
         let r = e
             .http
             .post(format!("{}/v1/responses", e.endpoint))
@@ -498,6 +499,19 @@ async fn service_ownership_raw_paths_enablement_and_shared_listener() {
             assert_eq!(body["__type"], "UnknownOperationException");
         }
     }
+    let lambda = e
+        .http
+        .post(format!("{}/v1/responses", e.endpoint))
+        .header("authorization", signing("lambda"))
+        .body("{")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(lambda.status(), 404);
+    assert_eq!(
+        lambda.headers()["x-amzn-errortype"],
+        "ResourceNotFoundException"
+    );
     let r = e
         .http
         .post(format!("{}/v1/responses", e.endpoint))

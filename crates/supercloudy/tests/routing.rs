@@ -80,7 +80,6 @@ async fn target_and_signing_scope_ownership_precede_rest_paths() {
             Some(auth("s3")),
         ),
         ("POST", "/", Some("UnimplementedService.GetParameter"), None),
-        ("PUT", "/synthetic-bucket/key", None, Some(auth("lambda"))),
         ("PUT", "/synthetic-bucket/key", None, Some(auth("dynamodb"))),
         ("POST", "/", None, None),
     ] {
@@ -96,6 +95,18 @@ async fn target_and_signing_scope_ownership_precede_rest_paths() {
         let body = response.text().await.unwrap();
         assert!(body.contains("com.amazon.coral.service#UnknownOperationException"));
     }
+    let lambda = c
+        .put(format!("{}/synthetic-bucket/key", e.endpoint))
+        .header("authorization", auth("lambda"))
+        .body("{")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(lambda.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        lambda.headers()["x-amzn-errortype"],
+        "ResourceNotFoundException"
+    );
     let response = c
         .get(format!("{}/synthetic-bucket/key", e.endpoint))
         .send()
