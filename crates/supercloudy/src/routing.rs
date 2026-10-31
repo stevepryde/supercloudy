@@ -7,6 +7,7 @@ pub(crate) enum Route {
     Ssm(Option<String>),
     OpenAi,
     Firebase,
+    Lambda,
     Unknown,
     InvalidS3,
 }
@@ -23,7 +24,12 @@ fn scope(value: &str) -> Option<&str> {
         .then(|| parts[3])
 }
 
-pub(crate) fn classify(request: &Request, openai_enabled: bool, firebase_enabled: bool) -> Route {
+pub(crate) fn classify(
+    request: &Request,
+    openai_enabled: bool,
+    firebase_enabled: bool,
+    lambda_enabled: bool,
+) -> Route {
     let headers = request.headers();
     if headers.contains_key("x-amz-target") {
         if headers.get_all("x-amz-target").iter().count() != 1 {
@@ -135,12 +141,16 @@ pub(crate) fn classify(request: &Request, openai_enabled: bool, firebase_enabled
         return match service.as_str() {
             "s3" => Route::S3,
             "ssm" => Route::Ssm(None),
+            "lambda" => Route::Lambda,
             // DynamoDB without its required target retains its own unknown-operation codec.
             _ => Route::Unknown,
         };
     }
     if bucket_hint {
         return Route::S3;
+    }
+    if lambda_enabled && crate::lambda::reserved(request.uri().path()) {
+        return Route::Lambda;
     }
     if openai_enabled && request.method() == Method::POST && request.uri().path() == "/v1/responses"
     {

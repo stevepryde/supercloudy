@@ -1,15 +1,15 @@
 # supercloudy architecture
 
-Status: in-memory DynamoDB, S3, SSM GetParameter, local Responses fixtures and Firebase ID token issuer.
+Status: in-memory DynamoDB, S3, SSM GetParameter, Lambda Invoke, local Responses fixtures and Firebase ID token issuer.
 
 ## Scope
 
 supercloudy is an independent Rust process serving subsets of DynamoDB's JSON
-wire protocol, S3's REST/XML protocol, SSM's JSON 1.1 protocol and a generic
+wire protocol, S3's REST/XML protocol, SSM's JSON 1.1 protocol, Lambda's REST Invoke API and a generic
 OpenAI Responses stub and Firebase ID token issuer on one listener. Consumers use ordinary AWS SDKs or HTTP
 clients against a local endpoint.
 There are no consumer dependencies, persistent storage, cloud calls, or cloud
-credentials. Fixtures and examples are synthetic; dummy credentials are `test`.
+credentials. Only explicitly configured Lambda targets make loopback HTTP calls. Fixtures and examples are synthetic; dummy credentials are `test`.
 
 The `supercloudy up --port <u16>` CLI binds `127.0.0.1`, defaults to port 8000,
 prints its actual address, and serves until interrupted. Repeatable `--bucket`
@@ -30,9 +30,11 @@ Every crate inherits the workspace MIT license. Cargo.lock is retained.
 | `s3/http` | URI/header decoding, presign expiry, bounded aws-chunked payload decoding |
 | `s3/protocol` | REST/XML responses, HTTP metadata and errors |
 | `faults` | Shared ordinal validation, ordered scheduling and per-instance counters only |
-| `fault_config` | Unchanged public AWS fault schema and assembly of service validators |
+| `fault_config` | AWS fault schema and assembly of service validators |
 | `ssm` | Immutable synthetic parameters, GetParameter validation and JSON 1.1 adapter |
 | `openai` | Immutable Responses fixtures, request validation and HTTP adapter |
+| `lambda` | Raw Invoke forwarding, bounded task ownership, acceptance and drain/cancel |
+| `lambda/faults` | Invoke fault schema and effects using the shared scheduler |
 | `firebase` | In-memory RSA key/certificate generation, mint validation and HTTP adapter |
 | `firebase/faults` | Issuer-local rejection variants and override validation |
 | `openai/faults` | Stub rule schema, validation, format matching and effect rendering |
@@ -51,7 +53,7 @@ Every crate inherits the workspace MIT license. Cargo.lock is retained.
 Domain code does not depend on Axum. There is no backend trait, mock interface,
 service registry, or persistence adapter. Runtime dependencies include Axum, Tokio, Clap, Serde/serde_json, base64,
 BigDecimal, quick-xml, time/httpdate, percent-encoding, and checksum algorithms.
-AWS SDKs and reqwest are dev dependencies.
+reqwest is an HTTP-only runtime dependency for loopback Invoke forwarding. AWS SDKs are dev dependencies.
 `dynamodb/reserved.txt` contains DynamoDB's public
 [reserved word list](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ReservedWords.html).
 
@@ -65,7 +67,7 @@ any body**, with this precedence:
    operations require `POST /`. SSM uses its own JSON 1.1 errors. Duplicate or
    malformed targets and unknown families retain generic JSON unknown-operation
    errors. Targets win even on bucket hosts or with conflicting signing hints.
-2. Without a target, explicit SigV4 scope owns dispatch: `s3`, `ssm`, `dynamodb`.
+2. Without a target, explicit SigV4 scope owns dispatch: `s3`, `ssm`, `dynamodb`, `lambda`.
    SSM/DynamoDB without their target return their own unknown-operation errors.
    Malformed/conflicting scopes and unsupported services fail before execution.
    Non-SigV4 Authorization is deferred to the selected service.
@@ -78,8 +80,8 @@ any body**, with this precedence:
 | SSM | `X-Amz-Target: AmazonSSM.<operation>`; operations require `POST /` | Active even with no parameters. Target family wins before signing/REST hints; `ssm` signing scope also owns missing-target errors. |
 | Responses stub | Exactly `POST /v1/responses`, ignoring query parameters | Active only with `--openai-fixtures` or `ServiceConfig.openai = Some(...)`, including empty fixtures. After explicit AWS selectors and bucket hosts; before path-style S3. |
 | Firebase issuer | Exactly `GET /robot/v1/metadata/x509/securetoken@system.gserviceaccount.com` and `POST /mint`, ignoring query parameters | Active only with `--firebase`, `--firebase-project-id`, `--firebase-cert-max-age` or `ServiceConfig.firebase = Some(...)`. After explicit AWS selectors and bucket hosts; before path-style S3. |
-| Lambda | Raw `/2015-03-31/functions` and `/2015-03-31/functions/...`, all methods; invocation is `POST /2015-03-31/functions/{function}/invocations` | Future, inactive. After AWS selectors and bucket hosts, before HTTP stubs and path-style S3. |
-| Other plain HTTP stubs | Explicit exact method/raw-path pairs, such as `GET /certificates/synthetic.pem` | Future, inactive. After AWS selectors, bucket hosts and future Lambda paths, before path-style S3. |
+| Lambda | Raw `/2015-03-31/functions` and `/2015-03-31/functions/...`, all methods; invocation is `POST /2015-03-31/functions/{function}/invocations` | Active with `--lambda-functions` or `ServiceConfig.lambda = Some(...)`. A Lambda signing scope owns dispatch even when unconfigured. After AWS selectors and bucket hosts, before HTTP stubs and path-style S3. |
+| Other plain HTTP stubs | Explicit exact method/raw-path pairs, such as `GET /certificates/synthetic.pem` | Future, inactive. After AWS selectors, bucket hosts and Lambda paths, before path-style S3. |
 
 Reservations match raw paths without percent decoding or normalization. No prefix,
 trailing-slash, other-method or percent-encoded HTTP stub reservation is implied.
@@ -95,7 +97,7 @@ before any body is collected. Other methods, encoded paths, trailing slashes and
 disabled Firebase endpoints retain S3 ownership. Thus `GET /mint` still addresses
 the S3 bucket `mint`; bucket hosts or S3 signing preserve S3 access to reserved
 paths (including bucket `robot` and its certificate-looking object key).
-Future Lambda paths collide with bucket `2015-03-31`; use bucket hosts or S3
+Lambda paths collide with bucket `2015-03-31`; use bucket hosts or S3
 signing to preserve S3 ownership. No registry or service plugin trait is used.
 
 S3 owns a separate ordered bucket/object map and lock. Put, Copy (including across
@@ -160,6 +162,60 @@ only after auth, bounded collection, decoding, validation and fixture lookup.
 All matching counters advance, first eligible rule wins, retries count anew,
 and instances/services have independent counters. Locks are released before
 response construction. There are no SSM fault rules in this slice.
+
+## Local Lambda Invoke
+
+`--lambda-functions <json-file>` loads an immutable function-name map. Each target
+is either a credential-free loopback HTTP URL or a literal UTF-8 canned response
+with an optional function-error header. The config also owns ordered Invoke
+fault rules, `max_concurrency` (default 16, range 1..1024), and positive
+`shutdown_timeout_ms` (default 5000). See [README](../README.md#local-lambda-invoke)
+for the JSON schema and CLI examples. Invalid config fails before binding.
+
+The path adapter decodes the name segment once and looks it up exactly. Unknown
+names use REST/JSON 404 `ResourceNotFoundException`; errors include
+`x-amzn-errortype` and `x-amzn-requestid`. RequestResponse returns 200 plus raw
+handler bytes. The adapter preserves a target `X-Amz-Function-Error`; target
+non-2xx implies `Unhandled` when absent. Failure to connect/read a complete
+bounded response or a forwarding timeout is a 502 `ServiceException`, without
+a function-error header. Function failure never becomes an Invoke API failure.
+DryRun checks name/type/body and returns 204 without execution. Bodies are opaque:
+6 MiB for synchronous input/output and 1 MiB for Event input. Query options are
+rejected; no version/alias resolution, logs or management API is simulated.
+
+A shared semaphore bounds synchronous and asynchronous forwarding. Admission is
+nonblocking; exhaustion returns 429 without accepting work. For Event, the
+acceptance point is insertion into a runtime-owned `JoinSet` under the short
+admission mutex, with an owned semaphore permit. Only then may 202 be returned.
+The task owns payload, target, HTTP client and permit independently of the
+request future. It does not capture the task registry, avoiding an ownership
+cycle. Completed tasks are reaped during admission. There is no unbounded queue.
+All forwarding runs outside every service-state lock; other services retain
+independent locks. Proxies/redirects are disabled, connect timeout is 5 seconds,
+and complete forwarding timeout is 30 seconds. Responses are collected with an
+actual byte bound, not by trusting Content-Length.
+
+The CLI handles Ctrl-C and SIGTERM: `Runtime::shutdown` first closes Lambda
+admission, takes the task set out of the mutex, drains for the configured timeout
+and aborts/joins remaining tasks. The shared HTTP listener stays live throughout
+this drain so accepted handlers can finish their DynamoDB/S3 calls. Only then
+does HTTP graceful shutdown close acceptance and wait for in-flight requests.
+Library hosts use `runtime_with_services` and explicitly call shutdown before
+closing the shared HTTP listener.
+Router-only constructors retain task ownership in router state but provide no
+explicit drain. Dropping the final owner cancels tasks. Accepted Events are
+memory-only and may be lost on crash or forced termination. No durable queue,
+background scheduler service, retry/dead-letter simulation, result storage or
+outbound cloud calls are introduced. Async failures are discarded, without logs
+of payloads or secrets. This is the deliberate exception to the previous
+exclusion of background scheduling: bounded owned local invocation tasks only.
+
+Invoke-local faults reuse `faults::Schedule`: optional exact function-name
+selector, positive request ordinal/repeat, first eligible wins and per-instance
+counters. Fully validated non-DryRun requests with reserved capacity count.
+`throttle` and `service_error` prevent acceptance/execution; `function_error`
+executes a synthetic handler failure, including as an accepted Event. No changes
+to DynamoDB/S3 fault rules or counters are required.
 
 ## Local Firebase issuer
 
@@ -399,7 +455,7 @@ ValidationException rather than changing results silently.
 Table byte-size/capacity statistics are not simulated.
 
 Required checks are listed in [AGENTS.md](../AGENTS.md). Integration scenarios use
-Rust `aws-sdk-dynamodb` and `aws-sdk-s3` against independent real loopback listeners on random
+Rust `aws-sdk-dynamodb`, `aws-sdk-s3` and `aws-sdk-lambda` against independent real loopback listeners on random
 ports, with explicit endpoint_url and dummy credentials. They exercise every
 operation, typed values, conditions and error decoding, nested updates,
 pre-update operands, numeric identity/order, range/prefix queries, pagination,

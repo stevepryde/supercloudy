@@ -1213,11 +1213,14 @@ async fn routing_precedence_conflicts_and_partial_presigns_do_not_execute() {
         .header("authorization", "AWS4-HMAC-SHA256 Credential=test/20261031/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=test")
         .body("overwrite").send().await);
     assert_eq!(conflict.status(), 400);
-    let unsupported = success(e.http.put(e.url("protected"))
+    let lambda = success(e.http.put(e.url("protected"))
         .header("authorization", "AWS4-HMAC-SHA256 Credential=test/20261031/us-east-1/lambda/aws4_request, SignedHeaders=host, Signature=test")
         .body("overwrite").send().await);
-    assert_eq!(unsupported.status(), 400);
-    assert!(success(unsupported.text().await).contains("UnknownOperationException"));
+    assert_eq!(lambda.status(), 404);
+    assert_eq!(
+        lambda.headers()["x-amzn-errortype"],
+        "ResourceNotFoundException"
+    );
     assert_eq!(e.bytes("protected").await, b"original");
     let root = success(e.http.post(&e.endpoint).body("not json").send().await);
     assert_eq!(root.status(), 400);

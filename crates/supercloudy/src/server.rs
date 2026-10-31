@@ -1,7 +1,7 @@
 use crate::{
     dynamodb,
     fault_config::Faults,
-    firebase, openai, protocol,
+    firebase, lambda, openai, protocol,
     routing::{self, Route},
     s3, ssm,
 };
@@ -31,8 +31,11 @@ pub struct ServiceConfig {
     pub ssm: SsmConfig,
     pub openai: Option<OpenAiConfig>,
     pub firebase: Option<FirebaseConfig>,
+    pub lambda: Option<LambdaConfig>,
 }
 pub use crate::firebase::Config as FirebaseConfig;
+pub use crate::lambda::faults::{Effect as LambdaFaultEffect, Rule as LambdaFaultRule};
+pub use crate::lambda::{Config as LambdaConfig, Target as LambdaTarget};
 pub use crate::openai::faults::{Effect as OpenAiFaultEffect, Rule as OpenAiFaultRule};
 pub use crate::openai::{Config as OpenAiConfig, Fixture};
 pub use crate::ssm::{Config as SsmConfig, Parameter, ParameterType};
@@ -53,6 +56,25 @@ struct Services {
     ssm: ssm::Service,
     openai: Option<openai::Service>,
     firebase: Option<firebase::Service>,
+    lambda: Option<lambda::Service>,
+}
+
+/// Own this runtime through shutdown; drain Events before closing the shared HTTP listener.
+pub struct Runtime {
+    router: Router,
+    lambda: Option<lambda::Service>,
+}
+impl Runtime {
+    pub fn router(&self) -> Router {
+        self.router.clone()
+    }
+
+    /// Stop Event admission, drain within the configured timeout, then abort and join leftovers.
+    pub async fn shutdown(&self) {
+        if let Some(lambda) = &self.lambda {
+            lambda.shutdown().await;
+        }
+    }
 }
 
 /// Construct an isolated in-memory emulator. Clones of this router share state.
@@ -64,7 +86,8 @@ pub fn router() -> Router {
 pub fn router_with_faults(config: FaultConfig) -> Result<Router, FaultConfigError> {
     let faults = Faults::new(config)?;
     Ok(build(faults, Vec::new(), ServiceConfig::default())
-        .expect("empty bucket configuration is valid"))
+        .expect("empty bucket configuration is valid")
+        .router)
 }
 
 pub fn router_with_config(config: Config) -> Result<Router, ConfigError> {
@@ -75,6 +98,14 @@ pub fn router_with_services(
     config: Config,
     services: ServiceConfig,
 ) -> Result<Router, ConfigError> {
+    Ok(runtime_with_services(config, services)?.router)
+}
+
+/// Build the HTTP router together with explicit ownership of asynchronous work.
+pub fn runtime_with_services(
+    config: Config,
+    services: ServiceConfig,
+) -> Result<Runtime, ConfigError> {
     let faults = Faults::new(config.faults).map_err(|e| ConfigError(e.to_string()))?;
     build(faults, config.buckets, services)
 }
@@ -82,13 +113,19 @@ fn build(
     faults: Faults,
     buckets: Vec<String>,
     config: ServiceConfig,
-) -> Result<Router, ConfigError> {
+) -> Result<Runtime, ConfigError> {
     let firebase = config
         .firebase
         .map(firebase::Service::new)
         .transpose()
         .map_err(ConfigError)?;
+    let lambda = config
+        .lambda
+        .map(lambda::Service::new)
+        .transpose()
+        .map_err(ConfigError)?;
     let services = Services {
+        lambda: lambda.clone(),
         firebase,
         dynamodb: dynamodb::Service::with_scheduler(faults.clone()),
         s3: s3::Service::new(buckets, faults).map_err(ConfigError)?,
@@ -99,14 +136,24 @@ fn build(
             .transpose()
             .map_err(ConfigError)?,
     };
-    Ok(Router::new().fallback(dispatch).with_state(services))
+    Ok(Runtime {
+        router: Router::new().fallback(dispatch).with_state(services),
+        lambda,
+    })
 }
 async fn dispatch(State(services): State<Services>, request: Request) -> Response {
     let op = match routing::classify(
         &request,
         services.openai.is_some(),
         services.firebase.is_some(),
+        services.lambda.is_some(),
     ) {
+        Route::Lambda => {
+            return match services.lambda.as_ref() {
+                Some(lambda) => lambda.dispatch(request).await,
+                None => lambda::unconfigured(),
+            };
+        }
         Route::Ssm(op) => return services.ssm.dispatch(op.as_deref(), request).await,
         Route::OpenAi => {
             return services

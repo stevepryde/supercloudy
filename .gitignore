@@ -17,5 +17,5 @@ id_ed25519*
 .DS_Store
 
 
-# Local synthetic service configuration and scratch fixtures
+# Local synthetic service configuration, Invoke mappings and scratch fixtures
 .supercloudy/

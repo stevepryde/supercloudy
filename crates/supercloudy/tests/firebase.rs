@@ -27,6 +27,7 @@ impl Drop for Emulator {
 impl Emulator {
     async fn new(firebase: Option<FirebaseConfig>) -> Self {
         let router = router_with_services(Config { buckets: vec!["synthetic-bucket".into(), "robot".into(), "mint".into()], ..Default::default() }, ServiceConfig {
+            lambda: None,
             firebase,
             ssm: serde_json::from_value(json!({"parameters":[{"name":"/example/plain","type":"String","value":"synthetic"}]})).unwrap(),
             openai: Some(serde_json::from_value(json!({"fixtures":[{"format_name":"synthetic","output":{"ok":true}}]})).unwrap()),
