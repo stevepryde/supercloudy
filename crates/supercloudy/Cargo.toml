@@ -22,6 +22,9 @@ time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 httpdate = "1"
 http-body-util = "0.1"
 percent-encoding = "2"
+rsa = "0.9"
+rcgen = "0.14"
+jsonwebtoken = { version = "10.4", features = ["rust_crypto"] }
 
 [dev-dependencies]
 aws-sdk-dynamodb = "1.135.0"

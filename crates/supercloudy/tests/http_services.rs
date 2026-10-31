@@ -51,6 +51,7 @@ impl Emulator {
                 faults: serde_json::from_value(json!({"rules":rules})).unwrap(),
             },
             ServiceConfig {
+                firebase: None,
                 ssm: serde_json::from_value(parameters()).unwrap(),
                 openai: openai.map(|v| serde_json::from_value(v).unwrap()),
             },
@@ -610,7 +611,15 @@ fn bad_configuration_is_rejected_before_serving() {
     ] {
         let ssm = serde_json::from_value(config).unwrap();
         assert!(
-            router_with_services(Config::default(), ServiceConfig { ssm, openai: None }).is_err()
+            router_with_services(
+                Config::default(),
+                ServiceConfig {
+                    ssm,
+                    openai: None,
+                    ..Default::default()
+                }
+            )
+            .is_err()
         );
     }
     for config in [

@@ -3,6 +3,7 @@
 mod dynamodb;
 mod fault_config;
 mod faults;
+mod firebase;
 mod openai;
 mod protocol;
 mod routing;

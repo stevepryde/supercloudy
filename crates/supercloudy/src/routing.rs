@@ -6,6 +6,7 @@ pub(crate) enum Route {
     S3,
     Ssm(Option<String>),
     OpenAi,
+    Firebase,
     Unknown,
     InvalidS3,
 }
@@ -22,7 +23,7 @@ fn scope(value: &str) -> Option<&str> {
         .then(|| parts[3])
 }
 
-pub(crate) fn classify(request: &Request, openai_enabled: bool) -> Route {
+pub(crate) fn classify(request: &Request, openai_enabled: bool, firebase_enabled: bool) -> Route {
     let headers = request.headers();
     if headers.contains_key("x-amz-target") {
         if headers.get_all("x-amz-target").iter().count() != 1 {
@@ -144,6 +145,12 @@ pub(crate) fn classify(request: &Request, openai_enabled: bool) -> Route {
     if openai_enabled && request.method() == Method::POST && request.uri().path() == "/v1/responses"
     {
         return Route::OpenAi;
+    }
+    if firebase_enabled
+        && ((request.method() == Method::GET && request.uri().path() == crate::firebase::CERT_PATH)
+            || (request.method() == Method::POST && request.uri().path() == "/mint"))
+    {
+        return Route::Firebase;
     }
     if request.uri().path() != "/" {
         Route::S3
