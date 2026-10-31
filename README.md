@@ -1,8 +1,8 @@
 # supercloudy
 
-An in-memory DynamoDB and S3 emulator speaking AWS JSON 1.0 and REST/XML. Use
-normal AWS SDK clients against one local endpoint. No cloud account or disk storage
-is needed.
+An in-memory DynamoDB, S3 and SSM emulator with a local OpenAI Responses stub.
+Use ordinary AWS SDKs and HTTP clients against one loopback endpoint. No cloud
+account is needed; service handlers make no outbound network calls.
 
 ```sh
 cargo run -- up --port 8000 --bucket synthetic-images
@@ -124,35 +124,84 @@ allows up to 1 MiB of AWS chunk framing/trailers for maximum-size objects.
 Overflow returns `EntityTooLarge` and preserves any existing object. DynamoDB's
 independent JSON body limit remains 32 MiB.
 
-Routing inspects the authority/Host, method, raw path/query and target before body
-collection. Precedence is any `X-Amz-Target`, then explicit SigV4 service scope,
-then `<bucket>.localhost`, then non-root path-style S3. Unknown DynamoDB targets
-stay JSON errors; unsupported signing services cannot fall through to S3.
-Conflicting/malformed explicit signing scopes fail before execution.
-
-Future services reserve the following spaces on the shared base host. These
-reservations are documentation only; current non-root paths still reach S3:
-
-- SSM: `POST /` with target `AmazonSSM.<operation>`, at target precedence.
-- Lambda: all methods on raw `/2015-03-31/functions` and its `/...` descendants,
-  including `POST /2015-03-31/functions/{function}/invocations`.
-- Plain HTTP stubs: explicitly configured exact method/raw-path pairs only,
-  such as `GET /certificates/synthetic.pem`.
-
-When activated, future AWS scopes select their service. After target/scope/bucket
-host selection, Lambda paths precede configured HTTP pairs, which precede the
-path-style S3 fallback. Unsupported operations stay with their owning service.
-Raw reserved paths are matched without decoding or normalization. These future
-paths can collide with base-host path-style bucket/key requests; use bucket-host
-addressing or explicit S3 signing for such keys. Bucket hosts retain S3 object
-paths, including service-looking paths, subject to target/scope precedence.
-No future service or stub handlers are implemented.
+Routing selects service ownership before reading bodies: any `X-Amz-Target`,
+then explicit SigV4 scope, then `<bucket>.localhost`, then the enabled exact
+`POST /v1/responses` reservation, then non-root path-style S3. SSM target errors
+use JSON 1.1; DynamoDB retains JSON 1.0. Unknown operations stay with their service.
+Malformed/conflicting signing scopes fail before execution. GET/PUT, encoded or
+trailing-slash Responses paths remain S3. Explicit S3 signing and valid bucket
+hosts retain S3 ownership of service-looking paths. The full reservation table,
+including future inactive Lambda paths, is in [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 To exercise a running server with synthetic data and dummy credentials:
 
 ```sh
 cargo run --example s3_smoke -- http://localhost:8000 synthetic-images
 ```
+
+## SSM and local Responses fixtures
+
+Load synthetic JSON configuration once at startup:
+
+```sh
+supercloudy up --port 8000 --bucket synthetic-images \
+  --ssm-parameters crates/supercloudy/examples/ssm-parameters.json \
+  --openai-fixtures crates/supercloudy/examples/openai-fixtures.json
+```
+
+SSM config:
+
+```json
+{"parameters":[{"name":"/example/provider-key","type":"SecureString","value":"test","encrypted_value":"synthetic-ciphertext"}]}
+```
+
+`GetParameter` supports String, StringList and SecureString. Missing parameters
+return modeled `ParameterNotFound`. SecureString returns `encrypted_value` unless
+`WithDecryption` is true, then `value`. This is fixture selection, not encryption.
+No parameter writes, ARN/label/version lookup or KMS calls are supported.
+
+Responses config:
+
+```json
+{"fixtures":[{"format_name":"example_extraction","input_contains":"sample","output":{"items":["synthetic"]}}],"faults":[]}
+```
+
+Fixtures match exact `text.format.name` and optional case-sensitive substring in
+an individual input text entry; first match wins. Schema text and opaque image/file
+fields never participate. Output JSON becomes one `output_text` string in a completed
+Responses envelope. Consumer schema/parser validation belongs in consumer tests.
+No match returns 400 `fixture_not_found`. Every stub response has `x-request-id`.
+
+```sh
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1 \
+  aws --endpoint-url http://127.0.0.1:8000 ssm get-parameter \
+  --name /example/provider-key --with-decryption
+curl -i http://127.0.0.1:8000/v1/responses \
+  -H 'Authorization: Bearer test' -H 'Content-Type: application/json' \
+  -d '{"model":"synthetic-model","input":"sample","text":{"format":{"type":"json_schema","name":"example_extraction","strict":true,"schema":{"type":"object"}}}}'
+```
+
+One nonempty bearer is required; missing, empty or duplicate headers return 401.
+The stub never validates or forwards tokens. Streaming, background mode and tools
+are unsupported. SSM bodies are limited to 64 KiB; Responses JSON to 32 MiB,
+including base64 content. Invalid config fails before binding without logging values.
+Omitting `--ssm-parameters` gives an empty store; omitting `--openai-fixtures`
+disables the reservation. An empty fixture list enables it with no matches.
+Keep local config under ignored `.supercloudy/`; use only synthetic values and
+credential value `test`, including in ignored files.
+
+Responses faults belong to the fixtures config and preserve the AWS fault format:
+
+```json
+{"fixtures":[{"format_name":"example_extraction","output":{"items":[]}}],"faults":[{"format_name":"example_extraction","first_request":1,"repeat":2,"effect":"throttle"}]}
+```
+
+Effects are `throttle` (429), `internal_server_error` (500), and `incomplete`
+(200, status incomplete, empty output, reason max_output_tokens). Optional
+`format_name` selects one format; omission selects all matched fixtures. Only
+requests passing auth, size, validation and fixture lookup advance counters.
+Library callers use `server::router_with_services(Config, ServiceConfig)`;
+existing router functions and Config literals retain their defaults.
 
 ## Deterministic faults
 
@@ -197,7 +246,7 @@ cargo test --workspace --all-targets
 scripts/secret-scan.sh
 ```
 
-Behavior tests use `aws-sdk-dynamodb`, `aws-sdk-s3`, and reqwest with local endpoints, synthetic
+Behavior tests use `aws-sdk-dynamodb`, `aws-sdk-s3`, `aws-sdk-ssm`, and reqwest with local endpoints, synthetic
 fixtures, and credentials `test`. Each test spawns its own server on a random
 loopback port. No cloud account, Docker, or Python is required.
 

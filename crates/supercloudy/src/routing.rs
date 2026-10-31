@@ -4,6 +4,8 @@ use axum::{extract::Request, http::Method};
 pub(crate) enum Route {
     DynamoDb(String),
     S3,
+    Ssm(Option<String>),
+    OpenAi,
     Unknown,
     InvalidS3,
 }
@@ -20,14 +22,21 @@ fn scope(value: &str) -> Option<&str> {
         .then(|| parts[3])
 }
 
-pub(crate) fn classify(request: &Request) -> Route {
+pub(crate) fn classify(request: &Request, openai_enabled: bool) -> Route {
     let headers = request.headers();
     if headers.contains_key("x-amz-target") {
-        return if headers.get_all("x-amz-target").iter().count() == 1
-            && request.method() == Method::POST
-            && request.uri().path() == "/"
-        {
-            crate::dynamodb::operation(headers.get("x-amz-target").and_then(|v| v.to_str().ok()))
+        if headers.get_all("x-amz-target").iter().count() != 1 {
+            return Route::Unknown;
+        }
+        let Some(target) = headers.get("x-amz-target").and_then(|v| v.to_str().ok()) else {
+            return Route::Unknown;
+        };
+        let valid_endpoint = request.method() == Method::POST && request.uri().path() == "/";
+        if let Some(operation) = target.strip_prefix("AmazonSSM.") {
+            return Route::Ssm(valid_endpoint.then(|| operation.to_owned()));
+        }
+        return if valid_endpoint {
+            crate::dynamodb::operation(Some(target))
                 .map_or(Route::Unknown, |op| Route::DynamoDb(op.into()))
         } else {
             Route::Unknown
@@ -51,12 +60,15 @@ pub(crate) fn classify(request: &Request) -> Route {
     let mut malformed = false;
     let mut s3_hint = bucket_hint;
     let authorizations: Vec<_> = headers.get_all("authorization").iter().collect();
-    if authorizations.len() > 1 {
+    let aws_authorization = authorizations
+        .iter()
+        .any(|value| value.as_bytes().starts_with(b"AWS4-HMAC-SHA256"));
+    if aws_authorization && authorizations.len() > 1 {
         malformed = true;
     }
     for authorization in authorizations {
         let Ok(value) = authorization.to_str() else {
-            malformed = true;
+            malformed |= aws_authorization;
             continue;
         };
         if value.starts_with("AWS4-HMAC-SHA256") && !value.starts_with("AWS4-HMAC-SHA256 ") {
@@ -119,13 +131,21 @@ pub(crate) fn classify(request: &Request) -> Route {
         };
     }
     if let Some(service) = services.first() {
-        return if service == "s3" {
-            Route::S3
-        } else {
-            Route::Unknown
+        return match service.as_str() {
+            "s3" => Route::S3,
+            "ssm" => Route::Ssm(None),
+            // DynamoDB without its required target retains its own unknown-operation codec.
+            _ => Route::Unknown,
         };
     }
-    if bucket_hint || request.uri().path() != "/" {
+    if bucket_hint {
+        return Route::S3;
+    }
+    if openai_enabled && request.method() == Method::POST && request.uri().path() == "/v1/responses"
+    {
+        return Route::OpenAi;
+    }
+    if request.uri().path() != "/" {
         Route::S3
     } else {
         Route::Unknown

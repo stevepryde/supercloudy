@@ -16,3 +16,6 @@ id_ed25519*
 .npmrc
 .DS_Store
 
+
+# Local synthetic service configuration and scratch fixtures
+.supercloudy/

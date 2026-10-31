@@ -2,7 +2,7 @@ pub(crate) mod faults;
 mod http;
 mod protocol;
 
-use crate::faults::Faults;
+use crate::fault_config::Faults;
 use axum::{body::to_bytes, extract::Request, http::Method, response::Response};
 use base64::{
     Engine,
