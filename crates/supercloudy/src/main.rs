@@ -29,6 +29,15 @@ enum Command {
         /// JSON file enabling local Responses fixtures and optional faults.
         #[arg(long)]
         openai_fixtures: Option<PathBuf>,
+        /// Enable an in-memory Firebase ID token issuer for synthetic users.
+        #[arg(long)]
+        firebase: bool,
+        /// Default mint project (also enables the Firebase issuer).
+        #[arg(long)]
+        firebase_project_id: Option<String>,
+        /// Certificate cache lifetime in seconds (default 3600; enables Firebase).
+        #[arg(long)]
+        firebase_cert_max_age: Option<u32>,
     },
 }
 
@@ -42,6 +51,9 @@ async fn main() -> std::io::Result<()> {
                 buckets,
                 ssm_parameters,
                 openai_fixtures,
+                firebase,
+                firebase_project_id,
+                firebase_cert_max_age,
             },
     } = Cli::parse();
     let faults = faults
@@ -55,9 +67,18 @@ async fn main() -> std::io::Result<()> {
     let openai = openai_fixtures
         .map(|path| load_json(path, "OpenAI fixtures"))
         .transpose()?;
+    let firebase = (firebase || firebase_project_id.is_some() || firebase_cert_max_age.is_some())
+        .then_some(supercloudy::server::FirebaseConfig {
+            project_id: firebase_project_id,
+            cert_max_age: firebase_cert_max_age.unwrap_or(3600),
+        });
     let router = supercloudy::server::router_with_services(
         supercloudy::server::Config { faults, buckets },
-        supercloudy::server::ServiceConfig { ssm, openai },
+        supercloudy::server::ServiceConfig {
+            ssm,
+            openai,
+            firebase,
+        },
     )
     .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;

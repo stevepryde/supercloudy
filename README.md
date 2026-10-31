@@ -1,6 +1,6 @@
 # supercloudy
 
-An in-memory DynamoDB, S3 and SSM emulator with a local OpenAI Responses stub.
+An in-memory DynamoDB, S3 and SSM emulator with local OpenAI Responses and Firebase ID token stubs.
 Use ordinary AWS SDKs and HTTP clients against one loopback endpoint. No cloud
 account is needed; service handlers make no outbound network calls.
 
@@ -126,7 +126,8 @@ independent JSON body limit remains 32 MiB.
 
 Routing selects service ownership before reading bodies: any `X-Amz-Target`,
 then explicit SigV4 scope, then `<bucket>.localhost`, then the enabled exact
-`POST /v1/responses` reservation, then non-root path-style S3. SSM target errors
+`POST /v1/responses` and Firebase certificate/mint reservations, then non-root
+path-style S3. SSM target errors
 use JSON 1.1; DynamoDB retains JSON 1.0. Unknown operations stay with their service.
 Malformed/conflicting signing scopes fail before execution. GET/PUT, encoded or
 trailing-slash Responses paths remain S3. Explicit S3 signing and valid bucket
@@ -202,6 +203,68 @@ Effects are `throttle` (429), `internal_server_error` (500), and `incomplete`
 requests passing auth, size, validation and fixture lookup advance counters.
 Library callers use `server::router_with_services(Config, ServiceConfig)`;
 existing router functions and Config literals retain their defaults.
+
+## Local Firebase ID tokens
+
+Start an issuer with an optional default project:
+
+```sh
+cargo run -- up --port 8000 --firebase-project-id synthetic-project
+```
+
+`--firebase` enables it without a default (supply `project_id` when minting).
+`--firebase-cert-max-age 60` sets the certificate cache lifetime, default 3600
+seconds. Both configuration flags also enable the service. Library callers set
+`ServiceConfig.firebase = Some(server::FirebaseConfig { project_id:
+Some("synthetic-project".into()), ..Default::default() })`.
+
+Point your client's **certificate URL** setting at:
+
+```text
+http://127.0.0.1:8000/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com
+```
+
+Keep its expected project/audience `synthetic-project` and issuer
+`https://securetoken.google.com/synthetic-project`. Use normal RS256 verification
+with a certificate selected by token kid. The endpoint returns Google's JSON
+`{kid: PEM certificate}` shape and `Cache-Control: public, max-age=N`.
+If a client has no certificate URL setting, it needs that configuration seam.
+
+Mint a synthetic ID token (the response contains a bearer token; keep it out of
+logs). This example prints only token length and public metadata:
+
+```sh
+curl -sS http://127.0.0.1:8000/mint \
+  -H 'Content-Type: application/json' \
+  -d '{"sub":"synthetic-user","email":"user@example.test","email_verified":true,"extra_claims":{"role":"reader"}}' \
+  | jq '{token_length:(.id_token|length),project_id,kid,iat,exp}'
+```
+
+The JSON response has `id_token`, `project_id`, `kid`, `iat`, and `exp`. Pass
+`id_token` to the client's existing ID token authentication flow. `sub` and
+`email` are required; `email_verified` defaults to true. Supply `project_id` to
+override the configured project. `extra_claims` cannot replace identity/issuer
+claims. Optional `ttl` is positive seconds (default 3600); `iat` and `exp` are
+unsigned Unix seconds. `ttl` and `exp` cannot be combined. Mint bodies are limited
+to 64 KiB; malformed/invalid requests return 400 and oversized bodies return 413.
+
+Add `"variant":"expired"`, `"variant":"bad_kid"` or `"variant":"wrong_aud"`
+to mint tokens rejected for expiry, kid lookup or audience. The expired variant
+is one hour past expiry (beyond a 60-second verifier leeway) and cannot combine
+with time overrides. `"kid":"chosen-header-kid"` changes only the JWT header;
+it cannot combine with `bad_kid`. Explicit time overrides can also produce
+invalid tokens. `email_verified:false` supports verification rejection tests.
+
+RSA keys and self-signed certificates are generated in memory at startup and
+never persisted. Restarting changes the key and kid; clear a client's certificate
+cache after restart. There is no OAuth flow, refresh token or outbound Google
+request. Use synthetic users only.
+
+When enabled, only the exact base-host `GET` certificate path and `POST /mint`
+are reserved. AWS targets/signing scopes and bucket hosts still win. Query
+parameters do not change reservations; wrong methods, trailing slashes and
+percent-encoded paths retain S3 ownership. Omitting all Firebase flags disables
+both reservations. See [the architecture contract](docs/ARCHITECTURE.md).
 
 ## Deterministic faults
 

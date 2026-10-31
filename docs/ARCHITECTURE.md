@@ -1,12 +1,12 @@
 # supercloudy architecture
 
-Status: in-memory DynamoDB, S3, SSM GetParameter and local Responses fixtures.
+Status: in-memory DynamoDB, S3, SSM GetParameter, local Responses fixtures and Firebase ID token issuer.
 
 ## Scope
 
 supercloudy is an independent Rust process serving subsets of DynamoDB's JSON
 wire protocol, S3's REST/XML protocol, SSM's JSON 1.1 protocol and a generic
-OpenAI Responses stub on one listener. Consumers use ordinary AWS SDKs or HTTP
+OpenAI Responses stub and Firebase ID token issuer on one listener. Consumers use ordinary AWS SDKs or HTTP
 clients against a local endpoint.
 There are no consumer dependencies, persistent storage, cloud calls, or cloud
 credentials. Fixtures and examples are synthetic; dummy credentials are `test`.
@@ -33,6 +33,8 @@ Every crate inherits the workspace MIT license. Cargo.lock is retained.
 | `fault_config` | Unchanged public AWS fault schema and assembly of service validators |
 | `ssm` | Immutable synthetic parameters, GetParameter validation and JSON 1.1 adapter |
 | `openai` | Immutable Responses fixtures, request validation and HTTP adapter |
+| `firebase` | In-memory RSA key/certificate generation, mint validation and HTTP adapter |
+| `firebase/faults` | Issuer-local rejection variants and override validation |
 | `openai/faults` | Stub rule schema, validation, format matching and effect rendering |
 | `s3/faults` | S3 rule validation, bucket/key matching and error mapping |
 | `protocol` | AWS JSON response envelope and request IDs |
@@ -75,16 +77,24 @@ any body**, with this precedence:
 | --- | --- | --- |
 | SSM | `X-Amz-Target: AmazonSSM.<operation>`; operations require `POST /` | Active even with no parameters. Target family wins before signing/REST hints; `ssm` signing scope also owns missing-target errors. |
 | Responses stub | Exactly `POST /v1/responses`, ignoring query parameters | Active only with `--openai-fixtures` or `ServiceConfig.openai = Some(...)`, including empty fixtures. After explicit AWS selectors and bucket hosts; before path-style S3. |
+| Firebase issuer | Exactly `GET /robot/v1/metadata/x509/securetoken@system.gserviceaccount.com` and `POST /mint`, ignoring query parameters | Active only with `--firebase`, `--firebase-project-id`, `--firebase-cert-max-age` or `ServiceConfig.firebase = Some(...)`. After explicit AWS selectors and bucket hosts; before path-style S3. |
 | Lambda | Raw `/2015-03-31/functions` and `/2015-03-31/functions/...`, all methods; invocation is `POST /2015-03-31/functions/{function}/invocations` | Future, inactive. After AWS selectors and bucket hosts, before HTTP stubs and path-style S3. |
 | Other plain HTTP stubs | Explicit exact method/raw-path pairs, such as `GET /certificates/synthetic.pem` | Future, inactive. After AWS selectors, bucket hosts and future Lambda paths, before path-style S3. |
 
 Reservations match raw paths without percent decoding or normalization. No prefix,
-trailing-slash, other-method or percent-encoded Responses reservation is implied.
+trailing-slash, other-method or percent-encoded HTTP stub reservation is implied.
 When enabled, unsigned base-host `POST /v1/responses` takes precedence over the S3
 interpretation (bucket `v1`, key `responses`); `v1` is itself below S3's minimum
 bucket-name length. Explicit S3 signing retains S3's XML error on this path.
 Valid bucket-host addressing preserves service-looking object keys. GET/PUT
 `/v1/responses` and requests with the stub disabled retain S3 ownership.
+When Firebase is enabled, its exact base-host method/path pairs reserve the
+certificate and mint endpoints. AWS targets, explicit signing scopes (including
+S3), malformed/conflicting AWS selectors, and bucket hosts retain precedence,
+before any body is collected. Other methods, encoded paths, trailing slashes and
+disabled Firebase endpoints retain S3 ownership. Thus `GET /mint` still addresses
+the S3 bucket `mint`; bucket hosts or S3 signing preserve S3 access to reserved
+paths (including bucket `robot` and its certificate-looking object key).
 Future Lambda paths collide with bucket `2015-03-31`; use bucket hosts or S3
 signing to preserve S3 ownership. No registry or service plugin trait is used.
 
@@ -150,6 +160,53 @@ only after auth, bounded collection, decoding, validation and fixture lookup.
 All matching counters advance, first eligible rule wins, retries count anew,
 and instances/services have independent counters. Locks are released before
 response construction. There are no SSM fault rules in this slice.
+
+## Local Firebase issuer
+
+`up --firebase` enables the two exact reservations above; `--firebase-project-id`
+sets the default project and also enables it. `--firebase-cert-max-age <seconds>`
+also enables it and controls `Cache-Control: public, max-age=N` (default 3600).
+Library callers use `ServiceConfig.firebase = Some(FirebaseConfig { project_id,
+cert_max_age })`. Existing AWS config and fault rule formats are unchanged.
+
+Each service instance generates a fresh RSA-2048 key from OS randomness and a
+self-signed x509 certificate at construction. The certificate endpoint returns
+Google's JSON `{kid: PEM certificate}` shape; the kid is a SHA256 certificate
+fingerprint. The certificate is stable for the instance lifetime. Keys never
+leave memory; no persistence flag or state directory is provided. Restarting
+replaces the key and kid, so clients must discard cached certificates on restart.
+No Google calls, Identity Toolkit, OAuth, refresh tokens or key rotation occur.
+
+`POST /mint` requires JSON `sub` (1–128 characters) and nonempty `email`.
+`project_id` is required unless configured; it contains 1–128 ASCII letters,
+digits, hyphens or underscores. `email_verified` defaults to true. Optional
+`extra_claims` is an object and cannot replace `iss`, `aud`, `auth_time`, `iat`,
+`exp`, `sub`, `email`, `email_verified` or `firebase`. Unknown fields and invalid
+field types return 400 without echoing supplied values. Bodies are bounded at
+64 KiB of collected wire bytes; overflow returns 413.
+
+Tokens use RS256, `typ: JWT`, a kid header, issuer
+`https://securetoken.google.com/{project_id}`, audience `{project_id}`,
+`auth_time`/`iat` equal to the issue time, `exp` one hour later, and the requested
+identity fields. The `firebase` object has `sign_in_provider: password` and
+`identities.email: [email]`. These are synthetic ID tokens, not custom tokens.
+Optional unsigned Unix-second `iat` and `exp` or positive-second `ttl` override
+times (`exp` and `ttl` conflict; additions are checked for overflow). Explicit
+timestamps may intentionally be invalid for verification. `kid` overrides only
+the header; it never publishes another key.
+
+Issuer-local `variant` values are `expired` (iat two hours ago, exp one hour ago),
+`bad_kid` (unpublished kid), and `wrong_aud` (project plus `-wrong-audience`,
+issuer unchanged). `expired` conflicts with timestamp overrides; `bad_kid`
+conflicts with explicit kid. Validation and effects live in `firebase/faults.rs`;
+they do not add scheduler rules or change `FaultRule`. Mint success returns
+`{id_token, project_id, kid, iat, exp}`. All mint responses use `Cache-Control:
+no-store`. No keys or tokens are logged by the server.
+
+Real-loopback tests select a served x509 PEM by token kid and verify RS256,
+audience, issuer and expiry with jsonwebtoken, with an additional iat check.
+They cover rejection variants, isolation, invalid inputs and shared-port routing.
+The retained [issuer design](plans/firebase-issuer.md) records the boundaries.
 
 ## HTTP and encoding
 

@@ -1,7 +1,7 @@
 use crate::{
     dynamodb,
     fault_config::Faults,
-    openai, protocol,
+    firebase, openai, protocol,
     routing::{self, Route},
     s3, ssm,
 };
@@ -24,13 +24,15 @@ pub struct Config {
     pub faults: FaultConfig,
     pub buckets: Vec<String>,
 }
-/// Optional services on the existing listener. `Some` enables the Responses path,
-/// even with no fixtures. Parameters default to an empty immutable store.
+/// Optional services on the existing listener. `Some` enables each HTTP stub.
+/// Responses may have no fixtures. Parameters default to an empty immutable store.
 #[derive(Clone, Debug, Default)]
 pub struct ServiceConfig {
     pub ssm: SsmConfig,
     pub openai: Option<OpenAiConfig>,
+    pub firebase: Option<FirebaseConfig>,
 }
+pub use crate::firebase::Config as FirebaseConfig;
 pub use crate::openai::faults::{Effect as OpenAiFaultEffect, Rule as OpenAiFaultRule};
 pub use crate::openai::{Config as OpenAiConfig, Fixture};
 pub use crate::ssm::{Config as SsmConfig, Parameter, ParameterType};
@@ -50,6 +52,7 @@ struct Services {
     s3: s3::Service,
     ssm: ssm::Service,
     openai: Option<openai::Service>,
+    firebase: Option<firebase::Service>,
 }
 
 /// Construct an isolated in-memory emulator. Clones of this router share state.
@@ -80,7 +83,13 @@ fn build(
     buckets: Vec<String>,
     config: ServiceConfig,
 ) -> Result<Router, ConfigError> {
+    let firebase = config
+        .firebase
+        .map(firebase::Service::new)
+        .transpose()
+        .map_err(ConfigError)?;
     let services = Services {
+        firebase,
         dynamodb: dynamodb::Service::with_scheduler(faults.clone()),
         s3: s3::Service::new(buckets, faults).map_err(ConfigError)?,
         ssm: ssm::Service::new(config.ssm).map_err(ConfigError)?,
@@ -93,11 +102,23 @@ fn build(
     Ok(Router::new().fallback(dispatch).with_state(services))
 }
 async fn dispatch(State(services): State<Services>, request: Request) -> Response {
-    let op = match routing::classify(&request, services.openai.is_some()) {
+    let op = match routing::classify(
+        &request,
+        services.openai.is_some(),
+        services.firebase.is_some(),
+    ) {
         Route::Ssm(op) => return services.ssm.dispatch(op.as_deref(), request).await,
         Route::OpenAi => {
             return services
                 .openai
+                .as_ref()
+                .expect("configured route")
+                .dispatch(request)
+                .await;
+        }
+        Route::Firebase => {
+            return services
+                .firebase
                 .as_ref()
                 .expect("configured route")
                 .dispatch(request)
