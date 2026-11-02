@@ -14,6 +14,7 @@ use tokio::{net::TcpListener, task::JoinHandle};
 
 struct Emulator {
     client: Client,
+    endpoint: String,
     task: JoinHandle<()>,
 }
 impl Drop for Emulator {
@@ -34,10 +35,11 @@ impl Emulator {
             .behavior_version_latest()
             .region(Region::new("us-east-1"))
             .credentials_provider(Credentials::new("test", "test", None, None, "synthetic"))
-            .endpoint_url(endpoint)
+            .endpoint_url(&endpoint)
             .build();
         Self {
             client: Client::from_conf(config),
+            endpoint,
             task,
         }
     }
@@ -849,6 +851,28 @@ async fn batch_get_size_bound_returns_original_read_options_for_retry() {
 async fn batch_response_and_wire_limits_return_retryable_work_or_validation() {
     let e = Emulator::new().await;
     e.table("synthetic-response-size", false, false).await;
+    // A small valid write plus JSON whitespace exercises the inclusive wire
+    // boundary independently of decoded item and batch action limits.
+    let mut body = serde_json::json!({"RequestItems":{"synthetic-response-size":[
+        {"PutRequest":{"Item":{"pk":{"S":"at-wire-limit"}}}}
+    ]}})
+    .to_string();
+    body.extend(std::iter::repeat_n(' ', 16 * 1024 * 1024 - body.len()));
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(&e.endpoint)
+        .header("x-amz-target", "DynamoDB_20120810.BatchWriteItem")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        e.get("synthetic-response-size", "at-wire-limit").await,
+        Some(key("at-wire-limit"))
+    );
     // Distinct logical partitions exercise the aggregate response boundary,
     // rather than the smaller per-partition read boundary.
     for first in [0, 20, 40] {

@@ -177,6 +177,102 @@ async fn target_and_signing_scope_ownership_precede_rest_paths() {
 }
 
 #[tokio::test]
+async fn ambiguous_and_malformed_sigv4_fields_use_service_error_codec() {
+    let e = emulator(json!({"rules":[]})).await;
+    let credential = "test%2F20261031%2Fus-east-1%2Fs3%2Faws4_request";
+    let lambda_credential = "test%2F20261031%2Fus-east-1%2Flambda%2Faws4_request";
+    for (host, query, authorization, content_type, error) in [
+        (
+            "synthetic-bucket.localhost",
+            String::new(),
+            format!(
+                "Authorization: {}\r\nAuthorization: {}\r\n",
+                auth("s3"),
+                auth("s3")
+            )
+            .into_bytes(),
+            "application/xml",
+            "<Code>InvalidRequest</Code>",
+        ),
+        (
+            "synthetic-bucket.localhost",
+            String::new(),
+            b"Authorization: AWS4-HMAC-SHA256 \xff\r\n".to_vec(),
+            "application/xml",
+            "<Code>InvalidRequest</Code>",
+        ),
+        (
+            "localhost",
+            format!("?X-Amz-Credential={credential}&X-Amz-Credential={credential}"),
+            Vec::new(),
+            "application/xml",
+            "<Code>InvalidRequest</Code>",
+        ),
+        // S3 independently rejects duplicate fields later. Lambda scope makes
+        // routing rejection observable: dispatch would otherwise return 404.
+        (
+            "localhost",
+            String::new(),
+            format!(
+                "Authorization: {}\r\nAuthorization: {}\r\n",
+                auth("lambda"),
+                auth("lambda")
+            )
+            .into_bytes(),
+            "application/x-amz-json-1.0",
+            "com.amazon.coral.service#UnknownOperationException",
+        ),
+        (
+            "localhost",
+            format!("?X-Amz-Credential={lambda_credential}&X-Amz-Credential={lambda_credential}"),
+            Vec::new(),
+            "application/x-amz-json-1.0",
+            "com.amazon.coral.service#UnknownOperationException",
+        ),
+        (
+            "localhost",
+            "?X-Amz-Credential=test%2F20261031%2Fus-east-1%2Fs3%2Finvalid".into(),
+            Vec::new(),
+            "application/xml",
+            "<Code>InvalidRequest</Code>",
+        ),
+        (
+            "localhost",
+            "?X-Amz-Credential=test%2F20261031%2Fus-east-1%2Fssm%2Finvalid".into(),
+            Vec::new(),
+            "application/x-amz-json-1.0",
+            "com.amazon.coral.service#UnknownOperationException",
+        ),
+    ] {
+        let mut stream = TcpStream::connect(e.endpoint.strip_prefix("http://").unwrap())
+            .await
+            .unwrap();
+        let mut request =
+            format!("GET /synthetic-bucket/key{query} HTTP/1.1\r\nHost: {host}\r\n").into_bytes();
+        request.extend(authorization);
+        request.extend_from_slice(b"Connection: close\r\n\r\n");
+        stream.write_all(&request).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_end(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 400 "), "{response}");
+        assert!(
+            response
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case(&format!("content-type: {content_type}"))),
+            "{response}"
+        );
+        assert!(response.contains(error), "{response}");
+    }
+}
+
+#[tokio::test]
 async fn s3_faults_count_only_valid_requests_and_preserve_state_and_instance_isolation() {
     let e = emulator(json!({"rules":[
         {"service":"s3","operation":"PutObject","bucket":"synthetic-bucket","key":"key","first_request":1,"repeat":1,"effect":{"type":"throttle"}},

@@ -113,6 +113,7 @@ async fn synchronous_raw_bytes_canned_handler_errors_and_dry_run() {
         .client
         .invoke()
         .function_name("synthetic-echo")
+        .invocation_type(InvocationType::RequestResponse)
         .payload(Blob::new(payload))
         .send()
         .await
@@ -156,6 +157,93 @@ async fn synchronous_raw_bytes_canned_handler_errors_and_dry_run() {
 }
 
 #[tokio::test]
+async fn invoke_accepts_the_synchronous_response_and_event_payload_limits() {
+    let (seen, mut received) = mpsc::channel(2);
+    let target = Listener::start(
+        Router::new()
+            .route(
+                "/echo",
+                post(move |body: Bytes| {
+                    let seen = seen.clone();
+                    async move {
+                        seen.send(body.len()).await.unwrap();
+                        body
+                    }
+                }),
+            )
+            .route(
+                "/oversized",
+                post(|| async {
+                    (
+                        [("x-amz-function-error", "Handled")],
+                        vec![b'x'; 6 * 1024 * 1024 + 1],
+                    )
+                }),
+            )
+            .layer(axum::extract::DefaultBodyLimit::disable()),
+    )
+    .await;
+    let payload = vec![b'x'; 6 * 1024 * 1024];
+    let e = Emulator::new(json!({"functions": {
+        "synthetic-echo": {"url":format!("{}/echo", target.url)},
+        "synthetic-oversized": {"url":format!("{}/oversized", target.url)},
+        "synthetic-canned": {"response":"x".repeat(6 * 1024 * 1024)}
+    }}))
+    .await;
+    let response = e
+        .client
+        .invoke()
+        .function_name("synthetic-echo")
+        .payload(Blob::new(payload.clone()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status_code(), 200);
+    assert_eq!(response.payload.unwrap().as_ref(), payload);
+    assert_eq!(received.recv().await.unwrap(), 6 * 1024 * 1024);
+    let response = e
+        .client
+        .invoke()
+        .function_name("synthetic-canned")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.payload.unwrap().as_ref(), payload);
+    let oversized = e
+        .client
+        .invoke()
+        .function_name("synthetic-oversized")
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        oversized.as_service_error().unwrap().code(),
+        Some("ServiceException")
+    );
+    let raw = oversized.raw_response().unwrap();
+    assert_eq!(raw.status().as_u16(), 502);
+    assert!(raw.headers().get("x-amz-function-error").is_none());
+    let response = e
+        .client
+        .invoke()
+        .function_name("synthetic-echo")
+        .invocation_type(InvocationType::Event)
+        .payload(Blob::new(vec![b'e'; 1024 * 1024]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status_code(), 202);
+    assert_eq!(
+        timeout(Duration::from_secs(5), received.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        1024 * 1024
+    );
+    e.runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn unknown_function_and_transport_failure_are_invocation_errors() {
     let gone = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", gone.local_addr().unwrap());
@@ -186,6 +274,60 @@ async fn unknown_function_and_transport_failure_are_invocation_errors() {
         Some("ServiceException")
     );
     assert_eq!(offline.raw_response().unwrap().status().as_u16(), 502);
+    e.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn default_concurrency_accepts_sixteen_events_before_saturation() {
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let gate = release.clone();
+    let (seen, mut received) = mpsc::channel(16);
+    let target = Listener::start(Router::new().route(
+        "/work",
+        post(move || {
+            let (gate, seen) = (gate.clone(), seen.clone());
+            async move {
+                seen.send(()).await.unwrap();
+                let _permit = gate.acquire().await.unwrap();
+                "done"
+            }
+        }),
+    ))
+    .await;
+    let e = Emulator::new(json!({"functions": {
+        "synthetic-worker": {"url":format!("{}/work", target.url)}
+    }}))
+    .await;
+    for _ in 0..16 {
+        let response = e
+            .client
+            .invoke()
+            .function_name("synthetic-worker")
+            .invocation_type(InvocationType::Event)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status_code(), 202);
+        timeout(Duration::from_secs(5), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let rejected = e
+        .client
+        .invoke()
+        .function_name("synthetic-worker")
+        .invocation_type(InvocationType::Event)
+        .send()
+        .await
+        .unwrap_err();
+    assert!(
+        rejected
+            .as_service_error()
+            .unwrap()
+            .is_too_many_requests_exception()
+    );
+    release.add_permits(16);
     e.runtime.shutdown().await;
 }
 
@@ -285,9 +427,58 @@ async fn routing_keeps_explicit_s3_ownership_and_validates_before_dispatch() {
     )
     .await;
     let http = reqwest::Client::new();
+    // Enabling Lambda reserves only its function paths; ordinary unsigned
+    // path-style storage requests must still reach S3 on the same listener.
+    let bucket_url = format!("{}/synthetic-storage", e.listener.url);
+    assert_eq!(http.put(&bucket_url).send().await.unwrap().status(), 200);
+    let object_url = format!("{bucket_url}/sample");
+    assert_eq!(
+        http.put(&object_url)
+            .body("synthetic object")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let object = http.get(&object_url).send().await.unwrap();
+    assert_eq!(object.status(), 200);
+    assert_eq!(object.text().await.unwrap(), "synthetic object");
     let url = format!(
         "{}/2015-03-31/functions/synthetic-name%3Aalias/invocations",
         e.listener.url
+    );
+    for method in [reqwest::Method::GET, reqwest::Method::PUT] {
+        let rejected = http.request(method, &url).send().await.unwrap();
+        assert_eq!(rejected.status(), 404);
+        assert_eq!(
+            rejected.headers()["x-amzn-errortype"],
+            "ResourceNotFoundException"
+        );
+    }
+    // Reject an extra path segment before attempting to decode the name.
+    let malformed_path = http
+        .post(format!(
+            "{}/2015-03-31/functions/a/%FF/invocations",
+            e.listener.url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(malformed_path.status(), 404);
+    assert_eq!(
+        malformed_path.headers()["x-amzn-errortype"],
+        "ResourceNotFoundException"
+    );
+    let unsupported_query = http
+        .post(format!("{url}?Qualifier=synthetic-version"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unsupported_query.status(), 400);
+    assert_eq!(
+        unsupported_query.headers()["x-amzn-errortype"],
+        "InvalidParameterValueException"
     );
     let invalid = http
         .post(&url)

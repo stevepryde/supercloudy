@@ -226,6 +226,11 @@ async fn ssm_validation_protocol_and_body_limit() {
         );
     }
     // Valid GetParameter JSON isolates collection overflow from JSON parse errors.
+    let mut at_limit = json!({"Name":"/example/plain"}).to_string();
+    at_limit.extend(std::iter::repeat_n(' ', 64 * 1024 - at_limit.len()));
+    let parameter = json_body(e.ssm_raw(&at_limit).await, 200, "x-amzn-requestid").await;
+    assert_eq!(parameter["Parameter"]["Name"], "/example/plain");
+    assert_eq!(parameter["Parameter"]["Value"], "synthetic");
     let oversized = format!(
         "{}{}",
         json!({"Name":"/example/plain"}),
@@ -347,6 +352,24 @@ async fn invalid_requests_do_not_consume_faults_and_all_matching_rules_advance()
         let mut invalid = request("example_extraction");
         invalid[field] = value;
         json_body(e.post(&invalid).await, 400, "x-request-id").await;
+    }
+    for (kind, schema) in [("text", json!({})), ("json_schema", json!(null))] {
+        let mut invalid = request("example_extraction");
+        invalid["text"]["format"]["type"] = json!(kind);
+        invalid["text"]["format"]["schema"] = schema;
+        let body = json_body(e.post(&invalid).await, 400, "x-request-id").await;
+        assert_eq!(body["error"]["code"], "invalid_request");
+    }
+    for block in [
+        json!({"type":"input_image"}),
+        json!({"type":"input_image","image_url":""}),
+        json!({"type":"input_file"}),
+        json!({"type":"input_file","file_data":"","file_id":"","file_url":""}),
+    ] {
+        let mut invalid = request("example_extraction");
+        invalid["input"] = json!([{"role":"user","content":[block]}]);
+        let body = json_body(e.post(&invalid).await, 400, "x-request-id").await;
+        assert_eq!(body["error"]["code"], "invalid_request");
     }
     json_body(e.post(&request("missing")).await, 400, "x-request-id").await;
     let invalid = e

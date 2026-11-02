@@ -391,7 +391,9 @@ operation sequences run through Rust SDK clients on real loopback listeners and
 compare responses and stored state with plain in-test maps. In-process properties
 exercise private expression/XML/JSON parsers and database snapshot/lock behavior.
 The snapshot properties race transactional writers and readers on separate runtime
-workers; each page must contain one committed revision.
+workers; each page must contain one committed revision. A Tokio deadline bounds
+the snapshot race. XML parser properties run in supervised child processes so a
+synchronous parser loop fails the test; their deadlines scale with the case count.
 
 SDK sequence/range and lock properties default to 32 cases each; parser properties
 default to 96. Each suite has a fixed RNG seed for reproducible ordinary runs.
@@ -407,6 +409,49 @@ Failures shrink to a smaller input and persist seeds in
 `tests/*.proptest-regressions` file. Keep regression seeds when fixing a real bug.
 Generated parser inputs include structured nesting as well as arbitrary text and
 bytes; the mixed NOT/grouping regression covers a previously aborting stack overflow.
+
+### Mutation testing
+
+Install the pinned tool and run the baseline plus mutation tests:
+
+```sh
+cargo install cargo-mutants --version 26.2.0 --locked
+bash scripts/mutants.sh
+```
+
+The runner uses the complete workspace test suite, including SDK and property
+tests. It defaults to four mutation workers sharing cargo-mutants' CPU jobserver;
+use `-j N` or `CARGO_MUTANTS_JOBS=N` to choose another count.
+Test timeouts adapt to five times the measured baseline with a 240-second
+minimum for scheduling variation. There are no repository-specific exclusions.
+Results stay in a printed temporary directory outside the checkout because the
+secret scanner also examines ignored files and mutation logs contain altered
+synthetic fixtures. Use `--output /tmp/supercloudy-mutants` to retain a chosen
+location outside the checkout.
+
+Extra cargo-mutants arguments pass through, including focused runs:
+
+```sh
+scripts/mutants.sh --shard 1/4 -j 2
+git diff > /tmp/supercloudy-changes.diff
+scripts/mutants.sh --in-diff /tmp/supercloudy-changes.diff
+scripts/mutants.sh --list
+```
+
+Unexplained survivors fail the runner. Prefer a behavioral regression test; for
+an equivalent mutation or a documented scope boundary, add the exact line from
+`mutants.out/missed.txt`, a literal tab, and a specific reason to
+[`mutants-survivors.txt`](mutants-survivors.txt). Listed mutants still run.
+Baseline failures, timeouts, and tool errors retain their failing exit status.
+Remove obsolete list entries when code changes; locations and replacements must
+match exactly, so an old exception cannot permit a different mutant.
+
+In the printed `mutants.out` directory, `caught.txt` lists mutations detected by
+failing tests, `missed.txt` lists surviving mutations, `timeout.txt` lists runs
+that exceeded the test deadline, and `unviable.txt` lists mutations that did not
+compile. `outcomes.json` contains counts and individual outcomes; `log/` and
+`diff/` show each run and its code change. Inspect timeouts separately; they
+are failures of the runner, not confirmed test kills.
 
 The secret scan checks regular files including ignored files, the Git index,
 and every commit reachable from local Git refs. It excludes `.git` metadata and
