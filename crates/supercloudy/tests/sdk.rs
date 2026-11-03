@@ -368,6 +368,69 @@ async fn failing_conditions_are_modeled_and_leave_state_unchanged() {
 }
 
 #[tokio::test]
+async fn condition_expression_boundaries_and_trailing_tokens_preserve_state() {
+    let e = Emulator::new().await;
+    e.table("synthetic-items", None).await;
+    e.client
+        .put_item()
+        .table_name("synthetic-items")
+        .item("pk", s("item-1"))
+        .item("revision", n("0"))
+        .send()
+        .await
+        .unwrap();
+    let condition = "pk = :pk";
+    let mut revision = 0;
+    // AWS permits 4 KiB expression strings; the emulator permits 32 grouped levels.
+    // https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Constraints.html#limits-expression-parameters
+    for (expression, accepted) in [
+        (format!("{condition:<4096}"), true),
+        (format!("{condition:<4097}"), false),
+        (
+            format!("{}{condition}{}", "(".repeat(32), ")".repeat(32)),
+            true,
+        ),
+        (
+            format!("{}{condition}{}", "(".repeat(33), ")".repeat(33)),
+            false,
+        ),
+        (
+            format!("NOT NOT {}{condition}{}", "(".repeat(31), ")".repeat(31)),
+            false,
+        ),
+        (format!("pk IN ({})", vec![":pk"; 100].join(",")), true),
+        (format!("pk IN ({})", vec![":pk"; 101].join(",")), false),
+        (format!("{condition} trailing"), false),
+    ] {
+        let result = e
+            .client
+            .update_item()
+            .table_name("synthetic-items")
+            .set_key(Some(key()))
+            .update_expression("SET #attr_name = :new_value")
+            .condition_expression(expression)
+            .expression_attribute_names("#attr_name", "revision")
+            .expression_attribute_values(":pk", s("item-1"))
+            .expression_attribute_values(":new_value", n(&(revision + 1).to_string()))
+            .send()
+            .await;
+        if accepted {
+            result.unwrap();
+            revision += 1;
+        } else {
+            assert_eq!(
+                result.unwrap_err().as_service_error().unwrap().code(),
+                Some("ValidationException")
+            );
+        }
+        assert_eq!(
+            e.get("synthetic-items", key()).await.unwrap(),
+            map(&[("pk", s("item-1")), ("revision", n(&revision.to_string()))])
+        );
+    }
+}
+
+#[tokio::test]
 async fn update_creation_return_values_and_operand_snapshot() {
     let e = Emulator::new().await;
     e.table("synthetic-items", None).await;
@@ -494,6 +557,7 @@ async fn nested_list_append_is_rejected_but_nested_if_not_exists_is_supported() 
         .await
         .unwrap();
     for expression in [
+        "SET entries = if_not_exists(:v, :v)",
         "SET entries = if_not_exists(entries, list_append(:v, :v))",
         "SET entries = list_append(list_append(:v, :v), :v)",
         "SET entries = list_append(:v, list_append(:v, :v))",
@@ -906,6 +970,26 @@ async fn document_paths_allow_32_dereferences_and_reject_33() {
             .unwrap();
         let expected = map(&[("pk", s("item-1")), ("doc", nested(n("2")))]);
         assert_eq!(e.get("synthetic-items", key()).await.unwrap(), expected);
+        let extra_level = if lists {
+            Av::L(vec![n("3")])
+        } else {
+            Av::M(map(&[("x", n("3"))]))
+        };
+        let error = e
+            .client
+            .update_item()
+            .table_name("synthetic-items")
+            .set_key(Some(key()))
+            .update_expression(format!("SET {path} = :next"))
+            .expression_attribute_values(":next", extra_level)
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_service_error().unwrap().code(),
+            Some("ValidationException")
+        );
+        assert_eq!(e.get("synthetic-items", key()).await.unwrap(), expected);
         let too_deep = format!("{path}{}", if lists { "[0]" } else { ".x" });
         let error = e
             .client
@@ -981,6 +1065,189 @@ async fn negative_numbers_and_number_sets_respect_the_item_size_boundary() {
             Some("ValidationException")
         );
         assert_eq!(e.get("synthetic-items", key()).await.unwrap(), original);
+    }
+}
+
+#[tokio::test]
+async fn invalid_attribute_values_cannot_replace_an_existing_item() {
+    let e = Emulator::new().await;
+    e.table("synthetic-items", None).await;
+    let original = map(&[("pk", s("item-1")), ("payload", s("original"))]);
+    e.client
+        .put_item()
+        .table_name("synthetic-items")
+        .set_item(Some(original.clone()))
+        .send()
+        .await
+        .unwrap();
+    let mut deep_list = n("1");
+    let mut deep_map = n("1");
+    for _ in 0..33 {
+        deep_list = Av::L(vec![deep_list]);
+        deep_map = Av::M(map(&[("x", deep_map)]));
+    }
+    for invalid in [
+        Av::Null(false),
+        n("1_0"),
+        n("1.2.3"),
+        n("e1"),
+        n("1e2e3"),
+        deep_list,
+        deep_map,
+    ] {
+        let error = e
+            .client
+            .put_item()
+            .table_name("synthetic-items")
+            .set_item(Some(map(&[("pk", s("item-1")), ("payload", invalid)])))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_service_error().unwrap().code(),
+            Some("ValidationException")
+        );
+        assert_eq!(e.get("synthetic-items", key()).await.unwrap(), original);
+    }
+}
+
+#[tokio::test]
+async fn scalar_keys_enforce_nonempty_values_and_byte_limits() {
+    let e = Emulator::new().await;
+    e.table("synthetic-items", Some(ScalarAttributeType::B))
+        .await;
+    let partition = s(&"é".repeat(1024));
+    let sort = Av::B(Blob::new(vec![255; 1024]));
+    let original = map(&[
+        ("pk", partition.clone()),
+        ("sk", sort.clone()),
+        ("payload", s("original")),
+    ]);
+    e.client
+        .put_item()
+        .table_name("synthetic-items")
+        .set_item(Some(original.clone()))
+        .send()
+        .await
+        .unwrap();
+    let valid_key = map(&[("pk", partition.clone()), ("sk", sort.clone())]);
+    assert_eq!(
+        e.get("synthetic-items", valid_key.clone()).await.unwrap(),
+        original
+    );
+    for (pk, sk) in [
+        (s(""), sort.clone()),
+        (s(&format!("{}x", "é".repeat(1024))), sort),
+        (partition.clone(), Av::B(Blob::new(Vec::<u8>::new()))),
+        (partition, Av::B(Blob::new(vec![255; 1025]))),
+    ] {
+        let error = e
+            .client
+            .put_item()
+            .table_name("synthetic-items")
+            .item("pk", pk)
+            .item("sk", sk)
+            .item("payload", s("invalid"))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_service_error().unwrap().code(),
+            Some("ValidationException")
+        );
+        assert_eq!(
+            e.get("synthetic-items", valid_key.clone()).await.unwrap(),
+            original
+        );
+    }
+    let scanned = e
+        .client
+        .scan()
+        .table_name("synthetic-items")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(scanned.items(), &[original]);
+}
+
+#[tokio::test]
+async fn conditions_measure_collections_compare_binary_and_find_typed_members() {
+    let e = Emulator::new().await;
+    e.table("synthetic-items", None).await;
+    let nested = Av::M(map(&[("x", Av::Bool(true))]));
+    let original = map(&[
+        ("pk", s("item-1")),
+        ("revision", n("1")),
+        ("binary", Av::B(Blob::new([0, 128, 255]))),
+        ("list", Av::L(vec![nested.clone(), Av::Bool(false)])),
+        ("document", Av::M(map(&[("a", n("1")), ("b", n("2"))]))),
+        ("numbers", Av::Ns(vec!["1".into(), "2".into()])),
+        ("binaries", Av::Bs(vec![Blob::new([0]), Blob::new([255])])),
+    ]);
+    e.client
+        .put_item()
+        .table_name("synthetic-items")
+        .set_item(Some(original.clone()))
+        .send()
+        .await
+        .unwrap();
+    let updated = e
+        .client
+        .update_item()
+        .table_name("synthetic-items")
+        .set_key(Some(key()))
+        .update_expression("SET revision = :next")
+        .condition_expression("size(#binary) = :three AND size(#list) = :two AND size(#map) = :two AND #binary > :lower AND #binary < :upper AND contains(#numbers, :one) AND contains(#binaries, :member) AND contains(#list, :nested)")
+        .expression_attribute_names("#binary", "binary")
+        .expression_attribute_names("#list", "list")
+        .expression_attribute_names("#map", "document")
+        .expression_attribute_names("#numbers", "numbers")
+        .expression_attribute_names("#binaries", "binaries")
+        .expression_attribute_values(":next", n("2"))
+        .expression_attribute_values(":three", n("3"))
+        .expression_attribute_values(":two", n("2"))
+        .expression_attribute_values(":lower", Av::B(Blob::new([0, 128, 254])))
+        .expression_attribute_values(":upper", Av::B(Blob::new([0, 129])))
+        .expression_attribute_values(":one", n("1.0"))
+        .expression_attribute_values(":member", Av::B(Blob::new([255])))
+        .expression_attribute_values(":nested", nested)
+        .return_values(ReturnValue::AllNew)
+        .send()
+        .await
+        .unwrap()
+        .attributes
+        .unwrap();
+    let mut expected = original;
+    expected.insert("revision".into(), n("2"));
+    assert_eq!(updated, expected);
+    assert_eq!(e.get("synthetic-items", key()).await.unwrap(), expected);
+    for (condition, name, value) in [
+        ("size(#attr) = :v", "binary", n("0")),
+        ("#attr > :v", "binary", Av::B(Blob::new([1]))),
+        ("contains(#attr, :v)", "numbers", n("3")),
+        ("contains(#attr, :v)", "binaries", Av::B(Blob::new([128]))),
+        ("contains(#attr, :v)", "list", Av::Bool(true)),
+    ] {
+        let error = e
+            .client
+            .update_item()
+            .table_name("synthetic-items")
+            .set_key(Some(key()))
+            .update_expression("SET revision = :next")
+            .condition_expression(condition)
+            .expression_attribute_names("#attr", name)
+            .expression_attribute_values(":v", value)
+            .expression_attribute_values(":next", n("3"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .as_service_error()
+                .unwrap()
+                .is_conditional_check_failed_exception()
+        );
+        assert_eq!(e.get("synthetic-items", key()).await.unwrap(), expected);
     }
 }
 
@@ -1314,6 +1581,7 @@ async fn invalid_updates_are_atomic_and_unsupported_queries_are_rejected() {
         "SET size = :v",
         "ADD revision :v SET revision = :v",
         "SET revision = :v * :v",
+        "SET revision = :v SET fresh = :v",
     ] {
         let err = c
             .update_item()
@@ -1334,6 +1602,30 @@ async fn invalid_updates_are_atomic_and_unsupported_queries_are_rejected() {
             original,
             "{expr}"
         );
+    }
+    for (expression, names, values) in [
+        (
+            "SET # = :v",
+            HashMap::from([("#".into(), "revision".into())]),
+            map(&[(":v", n("2"))]),
+        ),
+        ("SET revision = :", HashMap::new(), map(&[(":", n("2"))])),
+    ] {
+        let error = c
+            .update_item()
+            .table_name("synthetic-items")
+            .set_key(Some(key()))
+            .update_expression(expression)
+            .set_expression_attribute_names(Some(names))
+            .set_expression_attribute_values(Some(values))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_service_error().unwrap().code(),
+            Some("ValidationException")
+        );
+        assert_eq!(e.get("synthetic-items", key()).await.unwrap(), original);
     }
     let err = c
         .update_item()
@@ -1394,6 +1686,54 @@ async fn invalid_updates_are_atomic_and_unsupported_queries_are_rejected() {
         err.as_service_error().unwrap().code(),
         Some("ValidationException")
     );
+}
+
+#[tokio::test]
+async fn nested_add_delete_and_overlapping_removes_are_rejected_atomically() {
+    let e = Emulator::new().await;
+    e.table("synthetic-items", None).await;
+    let original = map(&[
+        ("pk", s("item-1")),
+        ("revision", n("1")),
+        (
+            "doc",
+            Av::M(map(&[
+                ("revision", n("1")),
+                ("tags", Av::Ss(vec!["red".into()])),
+            ])),
+        ),
+    ]);
+    e.client
+        .put_item()
+        .table_name("synthetic-items")
+        .set_item(Some(original.clone()))
+        .send()
+        .await
+        .unwrap();
+    for (expression, value) in [
+        ("ADD doc.revision :v", n("2")),
+        ("DELETE doc.tags :v", Av::Ss(vec!["red".into()])),
+        // Use a valid name: the reserved word `counter` would be rejected
+        // before the overlapping-path validation this request must exercise.
+        ("REMOVE doc, doc.revision SET revision = :v", n("2")),
+    ] {
+        let error = e
+            .client
+            .update_item()
+            .table_name("synthetic-items")
+            .set_key(Some(key()))
+            .update_expression(expression)
+            .expression_attribute_values(":v", value)
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_service_error().unwrap().code(),
+            Some("ValidationException"),
+            "{expression}"
+        );
+        assert_eq!(e.get("synthetic-items", key()).await.unwrap(), original);
+    }
 }
 
 #[tokio::test]
@@ -1722,7 +2062,11 @@ async fn conditions_handle_unicode_size_and_nonmatching_stored_types() {
     c.update_item().table_name("synthetic-items").set_key(Some(key())).update_expression("SET checked = :yes")
         .condition_expression("size(word) = :three AND (attribute_type(num, :kind) OR begins_with(num, :text)) AND (attribute_type(num, :kind) OR size(num) > :zero)")
         .expression_attribute_values(":yes",Av::Bool(true)).expression_attribute_values(":three",n("3")).expression_attribute_values(":kind",s("N")).expression_attribute_values(":text",s("4")).expression_attribute_values(":zero",n("0")).send().await.unwrap();
-    for (condition, value) in [("size(word) = :v", n("6")), ("contains(num, :v)", n("4"))] {
+    for (condition, value) in [
+        ("size(word) = :v", n("6")),
+        ("contains(num, :v)", n("4")),
+        ("size(num) = :v", n("0")),
+    ] {
         let err = c
             .delete_item()
             .table_name("synthetic-items")

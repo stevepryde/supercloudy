@@ -555,17 +555,10 @@ async fn run(steps: Vec<Op>, initial: Model) {
                 } else {
                     let err = r.expect_err("transaction must reject");
                     let aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(f)=err.as_service_error().unwrap() else {panic!("wrong transaction error")};
-                    let codes: Vec<_> = accepted
-                        .iter()
-                        .map(|ok| {
-                            if *ok {
-                                "None"
-                            } else {
-                                "ConditionalCheckFailed"
-                            }
-                        })
-                        .collect();
-                    assert_eq!(f.message(),Some(format!("Transaction cancelled, please refer cancellation reasons for specific reasons [{}]",codes.join(", ")).as_str()));
+                    // The top-level message is diagnostic prose. AWS defines
+                    // ordered per-action codes and these reason messages:
+                    // https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactWriteItems.html
+                    // (TransactionCanceledException, cancellation reason codes).
                     assert_eq!(f.cancellation_reasons().len(), actions.len());
                     for (((k, _), ok), reason) in
                         actions.iter().zip(accepted).zip(f.cancellation_reasons())

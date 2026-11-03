@@ -106,6 +106,71 @@ fn incompatible_faults_are_rejected_before_startup() {
     );
 }
 
+#[test]
+fn fault_reason_counts_and_batch_deferral_positions_are_validated_before_startup() {
+    for (reasons, accepted) in [
+        (vec!["TransactionConflict"; 100], true),
+        (vec!["TransactionConflict"; 101], false),
+        (vec!["None"], false),
+        (vec![], false),
+    ] {
+        let config = serde_json::from_value(json!({"rules":[{
+            "operation":"TransactWriteItems", "first_request":1, "repeat":1,
+            "effect":{"type":"transaction_canceled","reasons":reasons}
+        }]}))
+        .unwrap();
+        assert_eq!(
+            router_with_faults(config).is_ok(),
+            accepted,
+            "transaction cancellation reasons: {reasons:?}"
+        );
+    }
+    for (operation, positions, accepted) in [
+        ("BatchGetItem", json!({"synthetic-items":[99]}), true),
+        ("BatchGetItem", json!({"synthetic-items":[100]}), false),
+        ("BatchWriteItem", json!({"synthetic-items":[24]}), true),
+        ("BatchWriteItem", json!({"synthetic-items":[25]}), false),
+        ("BatchGetItem", json!({}), false),
+        ("BatchGetItem", json!({"":[0]}), false),
+        ("BatchGetItem", json!({"synthetic-items":[]}), false),
+    ] {
+        let config = serde_json::from_value(json!({"rules":[{
+            "operation":operation, "first_request":1, "repeat":1,
+            "effect":{"type":"batch_deferral","positions":positions}
+        }]}))
+        .unwrap();
+        assert_eq!(
+            router_with_faults(config).is_ok(),
+            accepted,
+            "{operation} deferral positions: {positions}"
+        );
+    }
+}
+
+#[test]
+fn fault_request_ranges_include_the_last_representable_ordinal() {
+    // Ordinals are one-based and repeat is a count: a single request at the
+    // largest ordinal is valid, but extending that interval is not.
+    for (first, repeat, accepted) in [
+        (u64::MAX, 1, true),
+        (u64::MAX - 1, 2, true),
+        (1, u64::MAX, true),
+        (u64::MAX, 2, false),
+        (2, u64::MAX, false),
+    ] {
+        let config = serde_json::from_value(json!({"rules":[{
+            "operation":"PutItem", "first_request":first, "repeat":repeat,
+            "effect":{"type":"throttle"}
+        }]}))
+        .unwrap();
+        assert_eq!(
+            router_with_faults(config).is_ok(),
+            accepted,
+            "range starting at {first} with {repeat} requests"
+        );
+    }
+}
+
 #[tokio::test]
 async fn throttle_counts_only_valid_matching_requests_and_prevents_mutation() {
     let e = Emulator::new(

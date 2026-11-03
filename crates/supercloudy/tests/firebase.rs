@@ -7,7 +7,7 @@ use std::{
 };
 use supercloudy::server::{Config, FirebaseConfig, ServiceConfig, router_with_services};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
     task::JoinHandle,
 };
@@ -103,6 +103,17 @@ async fn minted(r: Response) -> String {
     value["id_token"].as_str().unwrap().to_owned()
 }
 fn verify(token: &str, certs: &BTreeMap<String, String>, project: &str) -> Result<Value, String> {
+    verify_at(token, certs, project, None)
+}
+
+// Explicit-time fixtures use a verifier clock independent of wall-clock scheduling.
+// Ordinary minted tokens still exercise jsonwebtoken's real-time expiry validation.
+fn verify_at(
+    token: &str,
+    certs: &BTreeMap<String, String>,
+    project: &str,
+    now: Option<u64>,
+) -> Result<Value, String> {
     let header = decode_header(token).map_err(|_| "header".to_owned())?;
     if header.alg != Algorithm::RS256 {
         return Err("algorithm".into());
@@ -111,16 +122,19 @@ fn verify(token: &str, certs: &BTreeMap<String, String>, project: &str) -> Resul
     let key = DecodingKey::from_rsa_pem(cert.as_bytes()).map_err(|_| "certificate".to_owned())?;
     let mut validation = Validation::new(Algorithm::RS256);
     validation.leeway = 60;
+    validation.validate_exp = now.is_none();
     validation.set_audience(&[project]);
     validation.set_issuer(&[format!("https://securetoken.google.com/{project}")]);
     validation.set_required_spec_claims(&["exp", "iat", "aud", "iss", "sub"]);
     let claims = decode::<Value>(token, &key, &validation)
         .map_err(|e| format!("{:?}", e.kind()))?
         .claims;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    if let Some(now) = now
+        && claims["exp"].as_u64().is_none_or(|exp| exp <= now)
+    {
+        return Err("ExpiredSignature".into());
+    }
+    let now = now.unwrap_or_else(unix_now);
     if claims["iat"].as_u64().is_none_or(|iat| iat > now + 60) {
         return Err("iat".into());
     }
@@ -136,6 +150,109 @@ fn verify(token: &str, certs: &BTreeMap<String, String>, project: &str) -> Resul
     Ok(claims)
 }
 
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn assert_default_times(claims: &Value, before: u64, after: u64) {
+    let iat = claims["iat"].as_u64().unwrap();
+    let exp = claims["exp"].as_u64().unwrap();
+    assert!(
+        (before..=after).contains(&iat),
+        "iat outside mint request window"
+    );
+    assert_eq!(exp - iat, 3600);
+    assert_eq!(claims["auth_time"], iat);
+}
+
+#[tokio::test]
+async fn each_firebase_cli_flag_enables_the_issuer_independently() {
+    let http = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .unwrap();
+    for flags in [
+        vec!["--firebase"],
+        vec!["--firebase-project-id", PROJECT],
+        vec!["--firebase-cert-max-age", "123"],
+    ] {
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_supercloudy"))
+            .args(["up", "--port", "0"])
+            .args(&flags)
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let line = tokio::time::timeout(Duration::from_secs(60), lines.next_line())
+            .await
+            .expect("CLI did not start")
+            .unwrap()
+            .expect("CLI exited before listening");
+        let endpoint = line.strip_prefix("Listening on ").unwrap();
+        let certs = http.get(format!("{endpoint}{CERTS}")).send().await.unwrap();
+        assert_eq!(certs.status(), 200, "issuer disabled by {flags:?}");
+        assert_eq!(
+            certs.headers()["cache-control"],
+            if flags[0] == "--firebase-cert-max-age" {
+                "public, max-age=123"
+            } else {
+                "public, max-age=3600"
+            }
+        );
+        // The project flag supplies the mint default; the other enabling flags
+        // require the request to select a synthetic project explicitly.
+        let mut request = input();
+        if flags[0] != "--firebase-project-id" {
+            request["project_id"] = json!(PROJECT);
+        }
+        let before = unix_now();
+        let response = http
+            .post(format!("{endpoint}/mint"))
+            .header("content-type", "application/json")
+            .body(request.to_string())
+            .send()
+            .await
+            .unwrap();
+        let token = minted(response).await;
+        let after = unix_now();
+        let certs = serde_json::from_slice(&certs.bytes().await.unwrap()).unwrap();
+        let claims =
+            verify(&token, &certs, PROJECT).expect("CLI issuer must mint a verifiable token");
+        assert_default_times(&claims, before, after);
+        child.kill().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn mint_accepts_the_subject_and_wire_body_size_boundaries() {
+    let e = Emulator::new(Some(config())).await;
+    let certs = e.certs().await;
+    let subject = "s".repeat(128);
+    let mut request = json!({
+        "sub": subject, "email": "user@example.test",
+        "extra_claims": {"padding": ""}
+    });
+    // The documented 64 KiB wire limit includes JSON framing. Fill the rest
+    // with ordinary claim data, so a smaller accidental cap rejects valid input.
+    let padding = 64 * 1024 - request.to_string().len();
+    request["extra_claims"]["padding"] = json!("x".repeat(padding));
+    let token = minted(e.mint(request.clone()).await).await;
+    let claims = verify(&token, &certs, PROJECT).expect("boundary input must mint a valid token");
+    assert_eq!(claims["sub"], subject);
+    request["extra_claims"]["padding"] = json!("x".repeat(padding + 1));
+    assert_eq!(e.mint(request).await.status(), 413);
+    let kid = "k".repeat(128);
+    let mut request = input();
+    request["kid"] = json!(kid);
+    let token = minted(e.mint(request).await).await;
+    assert_eq!(jsonwebtoken::decode_header(&token).unwrap().kid, Some(kid));
+}
+
 #[tokio::test]
 async fn served_certificate_verifies_google_claims_and_rejects_variants() {
     let e = Emulator::new(Some(config())).await;
@@ -148,7 +265,9 @@ async fn served_certificate_verifies_google_claims_and_rejects_variants() {
     );
     let mut request = input();
     request["extra_claims"] = json!({"role":"reader", "synthetic":{"enabled":true}});
+    let before = unix_now();
     let token = minted(e.mint(request).await).await;
+    let after = unix_now();
     let claims =
         verify(&token, &certs, PROJECT).expect("minted token must verify using served x509");
     assert_eq!(claims["sub"], "synthetic-user");
@@ -160,21 +279,7 @@ async fn served_certificate_verifies_google_claims_and_rejects_variants() {
         json!(["user@example.test"])
     );
     assert_eq!(claims["firebase"]["sign_in_provider"], "password");
-    assert_eq!(claims["auth_time"], claims["iat"]);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    assert!(
-        claims["iat"]
-            .as_u64()
-            .is_some_and(|iat| iat <= now && iat + 60 >= now)
-    );
-    assert!(
-        claims["exp"]
-            .as_u64()
-            .is_some_and(|exp| exp >= now + 3540 && exp <= now + 3600)
-    );
+    assert_default_times(&claims, before, after);
     for (variant, reason) in [
         ("expired", "ExpiredSignature"),
         ("bad_kid", "kid"),
@@ -210,34 +315,37 @@ async fn explicit_project_times_kid_and_unverified_email() {
     .await;
     let certs = e.certs().await;
     assert_eq!(e.mint(input()).await.status(), 400);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let now = 1_700_000_000;
     let mut request = input();
     request["project_id"] = json!("other-project");
     request["iat"] = json!(now - 30);
     request["ttl"] = json!(900);
     request["kid"] = json!(certs.keys().next().unwrap());
     let token = minted(e.mint(request.clone()).await).await;
-    let claims = verify(&token, &certs, "other-project").unwrap();
+    let claims = verify_at(&token, &certs, "other-project", Some(now)).unwrap();
     assert_eq!(claims["iat"], now - 30);
     assert_eq!(claims["exp"], now + 870);
+    assert_eq!(claims["auth_time"], now - 30);
     request.as_object_mut().unwrap().remove("ttl");
     request["exp"] = json!(now + 200);
-    let claims = verify(
-        &minted(e.mint(request.clone()).await).await,
-        &certs,
-        "other-project",
-    )
-    .unwrap();
+    let token = minted(e.mint(request.clone()).await).await;
+    let claims = verify_at(&token, &certs, "other-project", Some(now)).unwrap();
+    assert_eq!(claims["iat"], now - 30);
     assert_eq!(claims["exp"], now + 200);
+    verify_at(&token, &certs, "other-project", Some(now + 199)).unwrap();
+    for expired_at in [now + 200, now + 201] {
+        assert_eq!(
+            verify_at(&token, &certs, "other-project", Some(expired_at)).unwrap_err(),
+            "ExpiredSignature"
+        );
+    }
     request["iat"] = json!(now + 3600);
     assert_eq!(
-        verify(
+        verify_at(
             &minted(e.mint(request.clone()).await).await,
             &certs,
-            "other-project"
+            "other-project",
+            Some(now)
         )
         .unwrap_err(),
         "iat"
@@ -245,10 +353,11 @@ async fn explicit_project_times_kid_and_unverified_email() {
     request["iat"] = json!(now);
     request["email_verified"] = json!(false);
     assert_eq!(
-        verify(
+        verify_at(
             &minted(e.mint(request).await).await,
             &certs,
-            "other-project"
+            "other-project",
+            Some(now)
         )
         .unwrap_err(),
         "email_verified"
@@ -271,6 +380,8 @@ async fn mint_validation_is_bounded_and_does_not_echo_values() {
         json!({"ttl":-1}),
         json!({"iat":u64::MAX,"ttl":1}),
         json!({"ttl":1,"exp":2}),
+        json!({"variant":"expired","ttl":1}),
+        json!({"variant":"expired","iat":1}),
         json!({"variant":"expired","exp":1}),
         json!({"variant":"bad_kid","kid":"explicit"}),
         json!({"extra_claims":{"iss":"synthetic-sensitive-value"}}),

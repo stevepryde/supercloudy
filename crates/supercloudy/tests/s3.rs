@@ -13,7 +13,11 @@ use std::{
     net::Ipv4Addr,
     time::{Duration, SystemTime},
 };
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    task::JoinHandle,
+};
 
 const BUCKET: &str = "synthetic-bucket";
 // Published SHA-256("abc") and CRC32("123456789") vectors, encoded as S3 requires.
@@ -172,7 +176,10 @@ async fn s3_size_policy_preserves_binary_sdk_uploads_and_rejects_oversized_overw
 
     // The documented object boundary is independent of the wire framing budget.
     let maximum = vec![0x80; 64 * 1024 * 1024];
-    let mut framed = b"4000000\r\n".to_vec();
+    let mut framed = b"4000000;padding=".to_vec();
+    // A maximum-sized object still has room for ordinary chunk extensions.
+    framed.resize(4096, b'a');
+    framed.extend_from_slice(b"\r\n");
     framed.extend_from_slice(&maximum);
     framed.extend_from_slice(b"\r\n0\r\n\r\n");
     let response = success(
@@ -498,7 +505,7 @@ async fn sdk_ranges_and_empty_objects() {
             Some("InvalidRange")
         );
     }
-    for range in ["bytes=1-2,4-5", "bytes=wrong"] {
+    for range in ["bytes=1-2,4-5", "bytes=wrong", "bytes=+1-2", "bytes=1-+2"] {
         let response = success(
             e.http
                 .get(e.url("range"))
@@ -507,6 +514,17 @@ async fn sdk_ranges_and_empty_objects() {
                 .await,
         );
         assert_eq!(response.status(), 400);
+    }
+    for range in ["bytes=2-1", "bytes=-0"] {
+        let response = success(
+            e.http
+                .get(e.url("range"))
+                .header("range", range)
+                .send()
+                .await,
+        );
+        assert_eq!(response.status(), 416);
+        assert!(success(response.text().await).contains("<Code>InvalidRange</Code>"));
     }
     let response = success(
         e.http
@@ -628,6 +646,18 @@ async fn sdk_list_paginates_more_than_a_thousand_and_binds_cursors() {
         );
         assert!(page.contents().len() <= 1000);
         assert_eq!(page.key_count(), Some(page.contents().len() as i32));
+        // Check each page before following its cursor: a broken cursor filter
+        // can otherwise repeat a full page forever and hide the final assertion.
+        assert_eq!(
+            page.contents()
+                .iter()
+                .map(|o| o.key().unwrap())
+                .collect::<Vec<_>>(),
+            (keys.len()..1005)
+                .take(1000)
+                .map(|i| format!("matching/{i:04}"))
+                .collect::<Vec<_>>()
+        );
         for object in page.contents() {
             assert_eq!(object.size(), Some(1));
             assert!(object.e_tag().is_some());
@@ -679,7 +709,13 @@ async fn sdk_list_paginates_more_than_a_thousand_and_binds_cursors() {
     assert_eq!(next.continuation_token(), Some(token));
     assert_eq!(next.contents()[0].key(), Some("matching/0002"));
     assert_eq!(next.contents()[1].key(), Some("matching/0003"));
-    for (bucket, prefix, cursor) in [(BUCKET, "other/", token), (BUCKET, "matching/", "garbage")] {
+    for (bucket, prefix, cursor) in [
+        (BUCKET, "other/", token),
+        // Even when the cursor key matches both prefixes, its token remains
+        // bound to the exact prefix of the request that issued it.
+        (BUCKET, "match", token),
+        (BUCKET, "matching/", "garbage"),
+    ] {
         let error = e
             .client
             .list_objects_v2()
@@ -771,7 +807,19 @@ async fn sdk_presigned_put_get_attributes_disposition_and_expiry() {
             .presigned(config())
             .await,
     );
-    assert_eq!(e.send_presigned(request, Some(b"abc")).await.status(), 200);
+    let mut upload = e.http.put(request.uri()).query(&[
+        ("x-amz-meta-fixture", "presigned"),
+        ("content-type", "text/plain"),
+    ]);
+    // Hoisted attributes must behave like their header forms.
+    for (name, value) in request.headers() {
+        if !name.eq_ignore_ascii_case("x-amz-meta-fixture")
+            && !name.eq_ignore_ascii_case("content-type")
+        {
+            upload = upload.header(name, value);
+        }
+    }
+    assert_eq!(success(upload.body("abc").send().await).status(), 200);
     let head = success(
         e.client
             .head_object()
@@ -928,6 +976,19 @@ async fn malformed_requests_fail_before_overwriting_object_and_attributes() {
         (vec![("x-amz-tagging", "duplicate=one&duplicate=two")], 400),
         (vec![("x-amz-tagging", "=empty")], 400),
         (vec![("x-amz-server-side-encryption", "AES256")], 501),
+        (vec![("if-match", "test")], 501),
+        (vec![("x-amz-copy-source-if-match", "test")], 501),
+        (
+            vec![("x-amz-server-side-encryption-customer-algorithm", "AES256")],
+            501,
+        ),
+        (vec![("x-amz-acl", "private")], 501),
+        (vec![("x-amz-grant-read", "test")], 501),
+        (vec![("x-amz-checksum-sha1", "test")], 501),
+        (
+            vec![("x-amz-server-side-encryption-aws-kms-key-id", "test")],
+            400,
+        ),
         (
             vec![
                 ("x-amz-copy-source", "synthetic-bucket/protected"),
@@ -956,7 +1017,11 @@ async fn malformed_requests_fail_before_overwriting_object_and_attributes() {
         for (name, value) in headers {
             request = request.header(name, value);
         }
-        assert_eq!(success(request.send().await).status().as_u16(), expected);
+        let response = success(request.send().await);
+        assert_eq!(response.status().as_u16(), expected);
+        if expected == 501 {
+            assert!(success(response.text().await).contains("<Code>NotImplemented</Code>"));
+        }
         assert_eq!(e.bytes("protected").await, b"original");
     }
     for query in ["uploads", "uploadId=test", "tagging", "versionId=test"] {
@@ -998,6 +1063,14 @@ async fn malformed_requests_fail_before_overwriting_object_and_attributes() {
     let xml = success(escaped.text().await);
     assert!(xml.contains("&amp;key"));
     e.put("xml<&key", b"xml fixture").await;
+    let listed_xml = success(
+        e.http
+            .get(format!("{}/{BUCKET}?list-type=2&prefix=xml", e.endpoint))
+            .send()
+            .await,
+    );
+    assert_eq!(listed_xml.status(), 200);
+    assert_eq!(listed_xml.headers()["content-type"], "application/xml");
     let listed = success(
         e.client
             .list_objects_v2()
@@ -1028,6 +1101,33 @@ async fn malformed_requests_fail_before_overwriting_object_and_attributes() {
             }
         );
     }
+    for selector in ["", "?list-type=1"] {
+        let response = success(
+            e.http
+                .get(format!("{}/{BUCKET}{selector}", e.endpoint))
+                .send()
+                .await,
+        );
+        assert_eq!(response.status(), 501);
+        assert!(success(response.text().await).contains("<Code>NotImplemented</Code>"));
+    }
+}
+
+#[tokio::test]
+async fn create_bucket_rejects_invalid_general_purpose_names() {
+    let e = Emulator::new().await;
+    for name in [
+        "-synthetic",
+        "synthetic-",
+        "synthetic..bucket",
+        "192.0.2.1",
+        "xn--synthetic",
+        "synthetic-s3alias",
+    ] {
+        let response = success(e.http.put(format!("{}/{name}", e.endpoint)).send().await);
+        assert_eq!(response.status(), 400, "bucket {name}");
+        assert!(success(response.text().await).contains("<Code>InvalidBucketName</Code>"));
+    }
 }
 
 #[tokio::test]
@@ -1043,12 +1143,32 @@ async fn aws_chunked_decoding_checksum_trailers_and_rejected_framing() {
         .send().await);
     assert_eq!(response.status(), 200);
     assert_eq!(e.bytes("chunked").await, b"123456789");
+    let head = success(e.http.head(e.url("chunked")).send().await);
+    assert!(!head.headers().contains_key("content-encoding"));
+    let matching = success(
+        e.http
+            .put(e.url("chunked"))
+            .header("content-encoding", "aws-chunked")
+            .header("x-amz-checksum-crc32", CRC32_DIGITS)
+            .header("x-amz-trailer", "x-amz-checksum-crc32")
+            .body("9\r\n123456789\r\n0\r\nx-amz-checksum-crc32:y/Q5Jg==\r\n\r\n")
+            .send()
+            .await,
+    );
+    assert_eq!(matching.status(), 200);
     for (body, decoded_length, trailer) in [
         ("4\r\nabc", "3", true),
         // No announced trailer: only the decoded length is wrong.
         ("3\r\nabc\r\n0\r\n\r\n", "4", false),
         ("3\r\nabc\r\n0\r\n\r\n", "3", true),
         ("g\r\nabc\r\n0\r\n\r\n", "3", true),
+        ("+1\r\nx\r\n0\r\n\r\n", "1", false),
+        // A checksum trailer requires an announcement.
+        (
+            "9\r\n123456789\r\n0\r\nx-amz-checksum-crc32:y/Q5Jg==\r\n\r\n",
+            "9",
+            false,
+        ),
     ] {
         let mut request = e
             .http
@@ -1228,6 +1348,106 @@ async fn routing_precedence_conflicts_and_partial_presigns_do_not_execute() {
 }
 
 #[tokio::test]
+async fn percent_encoding_authorities_hoisting_and_tag_boundaries() {
+    let e = Emulator::new().await;
+    for key in ["bad%G0", "bad%0G"] {
+        let response = success(e.http.put(e.url(key)).body("synthetic").send().await);
+        assert_eq!(response.status(), 400);
+        assert!(success(response.text().await).contains("<Code>InvalidArgument</Code>"));
+    }
+    e.put("source", b"synthetic").await;
+    let response = success(
+        e.http
+            .get(format!(
+                "{}?response-content-disposition=attachment",
+                e.url("source")
+            ))
+            .header("response-content-disposition", "inline")
+            .send()
+            .await,
+    );
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-disposition"], "attachment");
+    let metadata = success(
+        e.http
+            .put(format!("{}?x-amz-meta-label=synthetic", e.url("metadata")))
+            .header("x-amz-meta-label", "synthetic")
+            .body("synthetic")
+            .send()
+            .await,
+    );
+    assert_eq!(metadata.status(), 200);
+    let conflict = success(
+        e.http
+            .put(format!("{}?x-amz-meta-label=other", e.url("metadata")))
+            .header("x-amz-meta-label", "synthetic")
+            .body("overwrite")
+            .send()
+            .await,
+    );
+    assert_eq!(conflict.status(), 400);
+    assert_eq!(e.bytes("metadata").await, b"synthetic");
+    let tags = (0..10)
+        .map(|n| format!("key{n}=value"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let tagged = success(
+        e.http
+            .put(e.url("tags"))
+            .header("x-amz-tagging", &tags)
+            .body("synthetic")
+            .send()
+            .await,
+    );
+    assert_eq!(tagged.status(), 200);
+    let head = success(e.http.head(e.url("tags")).send().await);
+    assert_eq!(head.headers()["x-amz-tagging-count"], "10");
+    for extra in ["&key10=value", "&key10=value&key11=value"] {
+        let rejected = success(
+            e.http
+                .put(e.url("tags"))
+                .header("x-amz-tagging", format!("{tags}{extra}"))
+                .body("overwrite")
+                .send()
+                .await,
+        );
+        assert_eq!(rejected.status(), 400);
+    }
+    for matching in [true, false] {
+        let mut stream = TcpStream::connect(("127.0.0.1", e.port)).await.unwrap();
+        let host = if matching {
+            format!("127.0.0.1:{}", e.port)
+        } else {
+            "other.localhost".into()
+        };
+        stream
+            .write_all(
+                format!(
+                    "GET {} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n",
+                    e.url("source")
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(
+            response.starts_with(if matching {
+                "HTTP/1.1 200 "
+            } else {
+                "HTTP/1.1 400 "
+            }),
+            "{response}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn unsupported_copy_encryption_and_malformed_bucket_xml_preserve_state() {
     let e = Emulator::new().await;
     e.put("source", b"source bytes").await;
@@ -1253,6 +1473,14 @@ async fn unsupported_copy_encryption_and_malformed_bucket_xml_preserve_state() {
         "<CreateBucketConfiguration><LocationConstraint>&undeclared;</LocationConstraint></CreateBucketConfiguration>",
         "<CreateBucketConfiguration>unexpected text</CreateBucketConfiguration>",
         "<![CDATA[unexpected]]><CreateBucketConfiguration/>",
+        "<WrongRoot></WrongRoot>",
+        "<CreateBucketConfiguration></CreateBucketConfiguration><CreateBucketConfiguration></CreateBucketConfiguration>",
+        "<!DOCTYPE CreateBucketConfiguration><CreateBucketConfiguration/>",
+        "<WrongRoot/>",
+        "<CreateBucketConfiguration/><CreateBucketConfiguration/>",
+        "<CreateBucketConfiguration><WrongChild/></CreateBucketConfiguration>",
+        "<!-- synthetic bucket configuration -->",
+        "<CreateBucketConfiguration>",
     ].iter().enumerate() {
         let bucket_url = format!("{}/synthetic-invalid-{index}", e.endpoint);
         let response = success(e.http.put(&bucket_url).body(*body).send().await);
@@ -1261,6 +1489,23 @@ async fn unsupported_copy_encryption_and_malformed_bucket_xml_preserve_state() {
         let absent = success(e.http.get(format!("{bucket_url}?list-type=2")).send().await);
         assert_eq!(absent.status(), 404);
         assert!(success(absent.text().await).contains("<Code>NoSuchBucket</Code>"));
+    }
+    for (index, body) in [
+        "<CreateBucketConfiguration/>",
+        "<CreateBucketConfiguration><LocationConstraint/></CreateBucketConfiguration>",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let bucket_url = format!("{}/synthetic-empty-xml-{index}", e.endpoint);
+        assert_eq!(
+            success(e.http.put(&bucket_url).body(*body).send().await).status(),
+            200
+        );
+        assert_eq!(
+            success(e.http.get(format!("{bucket_url}?list-type=2")).send().await).status(),
+            200
+        );
     }
     for (index, location) in ["us-east-1", "<![CDATA[us-east-1]]>", "us-east-&#49;"]
         .iter()

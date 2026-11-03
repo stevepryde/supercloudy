@@ -112,5 +112,30 @@ async fn protocol_errors_preserve_aws_envelopes_and_target_precedence() {
         assert_eq!(body["__type"], json!(format!("{namespace}#{code}")));
         assert!(body["message"].is_string());
     }
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+    // Collection failures retain their operation-specific wire error. No table
+    // or item validation is reached when the actual body exceeds 32 MiB.
+    for (operation, code) in [
+        ("GetItem", "SerializationException"),
+        ("BatchWriteItem", "ValidationException"),
+    ] {
+        let response = http
+            .post(format!("http://{address}/"))
+            .header("x-amz-target", format!("DynamoDB_20120810.{operation}"))
+            .body(vec![b' '; 32 * 1024 * 1024 + 1])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+        assert_eq!(
+            body["__type"],
+            format!("com.amazonaws.dynamodb.v20120810#{code}")
+        );
+    }
     server.abort();
 }

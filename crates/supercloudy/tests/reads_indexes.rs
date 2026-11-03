@@ -3,7 +3,7 @@ use aws_sdk_dynamodb::{
     config::{Credentials, Region},
     error::ProvideErrorMetadata,
     types::{
-        AttributeDefinition, AttributeValue as Av, BillingMode, GlobalSecondaryIndex,
+        AttributeDefinition, AttributeValue as Av, BillingMode, GlobalSecondaryIndex, IndexStatus,
         KeySchemaElement, KeyType, LocalSecondaryIndex, Projection, ProjectionType,
         ScalarAttributeType, Select,
     },
@@ -133,6 +133,164 @@ fn string(item: &HashMap<String, Av>, name: &str) -> String {
 }
 
 #[tokio::test]
+async fn key_limits_and_sparse_index_types_apply_to_the_selected_schema() {
+    let e = Emulator::new().await;
+    e.table(true).await;
+    // Partition keys allow 2048 bytes; sort keys allow 1024 bytes.
+    // https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Constraints.html#limits-partition-sort-keys
+    let partition = "p".repeat(2048);
+    let sort = "s".repeat(1024);
+    e.put(
+        &partition,
+        &sort,
+        &[("group_key", s(&partition)), ("rank_key", s(&sort))],
+    )
+    .await;
+    let item = e
+        .client
+        .get_item()
+        .table_name("synthetic-records")
+        .set_key(Some(key(&partition, &sort)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(item.item.as_ref().unwrap()["rank_key"], s(&sort));
+    for (attribute, value) in [
+        ("group_key", "g".repeat(2049)),
+        ("rank_key", "r".repeat(1025)),
+    ] {
+        let error = e
+            .client
+            .put_item()
+            .table_name("synthetic-records")
+            .set_item(Some(key("invalid", attribute)))
+            .item(attribute, s(&value))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_service_error().unwrap().code(),
+            Some("ValidationException")
+        );
+    }
+    e.client
+        .create_table()
+        .table_name("synthetic-mixed-types")
+        .billing_mode(BillingMode::PayPerRequest)
+        .key_schema(key_schema("pk", KeyType::Hash))
+        .attribute_definitions(definition("pk"))
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("rank_key")
+                .attribute_type(ScalarAttributeType::N)
+                .build()
+                .unwrap(),
+        )
+        .global_secondary_indexes(
+            GlobalSecondaryIndex::builder()
+                .index_name("by-number")
+                .key_schema(key_schema("rank_key", KeyType::Hash))
+                .projection(
+                    Projection::builder()
+                        .projection_type(ProjectionType::All)
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    e.client
+        .put_item()
+        .table_name("synthetic-mixed-types")
+        .item("pk", s("valid"))
+        .item("rank_key", Av::N("7".into()))
+        .send()
+        .await
+        .unwrap();
+    let indexed = e
+        .client
+        .query()
+        .table_name("synthetic-mixed-types")
+        .index_name("by-number")
+        .key_condition_expression("rank_key = :n")
+        .expression_attribute_values(":n", Av::N("7".into()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(indexed.items().len(), 1);
+    assert_eq!(indexed.items()[0]["pk"], s("valid"));
+}
+
+#[tokio::test]
+async fn query_accepts_an_exact_one_mib_page() {
+    let e = Emulator::new().await;
+    e.table(false).await;
+    // Attribute names total 11 bytes and key values total 2: each item is 256 KiB.
+    for sort in ["a", "b", "c", "d"] {
+        e.put("p", sort, &[("payload", s(&"x".repeat(256 * 1024 - 13)))])
+            .await;
+    }
+    let page = e
+        .client
+        .query()
+        .table_name("synthetic-records")
+        .key_condition_expression("pk = :p")
+        .expression_attribute_values(":p", s("p"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.scanned_count(), 4);
+    assert_eq!(page.items().len(), 4);
+    assert!(page.last_evaluated_key.is_none());
+}
+
+#[tokio::test]
+async fn local_index_base_fetch_rounds_index_and_each_item_to_four_kib() {
+    let e = Emulator::new().await;
+    e.table(true).await;
+    // Architecture contract: one rounded index block + 255 fetched blocks fits
+    // exactly 1 MiB. A fifth small row requires another fetched block.
+    for (sort, payload) in [
+        ("a", 64 * 4096 - 22),
+        ("b", 64 * 4096 - 22),
+        ("c", 64 * 4096 - 22),
+        ("d", 63 * 4096 - 22),
+        ("e", 1),
+    ] {
+        e.put(
+            "p",
+            sort,
+            &[("rank_key", s(sort)), ("payload", s(&"x".repeat(payload)))],
+        )
+        .await;
+    }
+    let page = e
+        .client
+        .query()
+        .table_name("synthetic-records")
+        .index_name("by-rank")
+        .key_condition_expression("pk = :p")
+        .expression_attribute_values(":p", s("p"))
+        .select(Select::AllAttributes)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.scanned_count(), 4);
+    assert_eq!(
+        page.items()
+            .iter()
+            .map(|item| string(item, "sk"))
+            .collect::<Vec<_>>(),
+        vec!["a", "b", "c", "d"]
+    );
+    let mut expected_cursor = key("p", "d");
+    expected_cursor.insert("rank_key".into(), s("d"));
+    assert_eq!(page.last_evaluated_key, Some(expected_cursor));
+}
+
+#[tokio::test]
 async fn index_projection_sparse_updates_and_invalid_candidates() {
     let e = Emulator::new().await;
     e.table(true).await;
@@ -159,6 +317,15 @@ async fn index_projection_sparse_updates_and_invalid_candidates() {
         .unwrap();
     assert_eq!(description.global_secondary_indexes().len(), 2);
     assert_eq!(description.local_secondary_indexes().len(), 1);
+    // DescribeTable exposes capacity mode and readiness of usable global indexes:
+    // https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TableDescription.html
+    assert_eq!(
+        description.billing_mode_summary().unwrap().billing_mode(),
+        Some(&BillingMode::PayPerRequest)
+    );
+    for index in description.global_secondary_indexes() {
+        assert_eq!(index.index_status(), Some(&IndexStatus::Active));
+    }
     let result = e
         .client
         .query()

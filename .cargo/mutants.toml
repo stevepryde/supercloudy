@@ -1,0 +1,12 @@
+# Run the complete workspace suite, including integration and property tests.
+test_workspace = true
+
+# Scale with the measured baseline on slow hosts. Parallel runs exceeded the
+# old 120-second floor during Firebase CLI RSA startup before reaching a mutant's
+# assertions; allow that observed scheduling variation with four workers.
+timeout_multiplier = 5.0
+minimum_test_timeout = 240.0
+
+# No repository-specific file, function, or mutation exclusions.
+# Keep cargo-mutants' default skip of with_capacity: allocation capacity does
+# not change the emulator's observable results.
