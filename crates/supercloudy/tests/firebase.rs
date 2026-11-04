@@ -103,39 +103,11 @@ async fn minted(r: Response) -> String {
     value["id_token"].as_str().unwrap().to_owned()
 }
 fn verify(token: &str, certs: &BTreeMap<String, String>, project: &str) -> Result<Value, String> {
-    verify_at(token, certs, project, None)
-}
-
-// Explicit-time fixtures use a verifier clock independent of wall-clock scheduling.
-// Ordinary minted tokens still exercise jsonwebtoken's real-time expiry validation.
-fn verify_at(
-    token: &str,
-    certs: &BTreeMap<String, String>,
-    project: &str,
-    now: Option<u64>,
-) -> Result<Value, String> {
-    let header = decode_header(token).map_err(|_| "header".to_owned())?;
-    if header.alg != Algorithm::RS256 {
-        return Err("algorithm".into());
-    }
-    let cert = header.kid.and_then(|kid| certs.get(&kid)).ok_or("kid")?;
-    let key = DecodingKey::from_rsa_pem(cert.as_bytes()).map_err(|_| "certificate".to_owned())?;
-    let mut validation = Validation::new(Algorithm::RS256);
-    validation.leeway = 60;
-    validation.validate_exp = now.is_none();
-    validation.set_audience(&[project]);
-    validation.set_issuer(&[format!("https://securetoken.google.com/{project}")]);
-    validation.set_required_spec_claims(&["exp", "iat", "aud", "iss", "sub"]);
-    let claims = decode::<Value>(token, &key, &validation)
-        .map_err(|e| format!("{:?}", e.kind()))?
-        .claims;
-    if let Some(now) = now
-        && claims["exp"].as_u64().is_none_or(|exp| exp <= now)
+    let claims = signed_claims(token, certs, project, true)?;
+    if claims["iat"]
+        .as_u64()
+        .is_none_or(|iat| iat > unix_now() + 60)
     {
-        return Err("ExpiredSignature".into());
-    }
-    let now = now.unwrap_or_else(unix_now);
-    if claims["iat"].as_u64().is_none_or(|iat| iat > now + 60) {
         return Err("iat".into());
     }
     if claims["sub"]
@@ -148,6 +120,31 @@ fn verify_at(
         return Err("email_verified".into());
     }
     Ok(claims)
+}
+
+// Historical and intentionally invalid timestamps are inspected as signed claims;
+// expiry validation, when enabled, belongs to jsonwebtoken.
+fn signed_claims(
+    token: &str,
+    certs: &BTreeMap<String, String>,
+    project: &str,
+    validate_exp: bool,
+) -> Result<Value, String> {
+    let header = decode_header(token).map_err(|_| "header".to_owned())?;
+    if header.alg != Algorithm::RS256 {
+        return Err("algorithm".into());
+    }
+    let cert = header.kid.and_then(|kid| certs.get(&kid)).ok_or("kid")?;
+    let key = DecodingKey::from_rsa_pem(cert.as_bytes()).map_err(|_| "certificate".to_owned())?;
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.leeway = 60;
+    validation.validate_exp = validate_exp;
+    validation.set_audience(&[project]);
+    validation.set_issuer(&[format!("https://securetoken.google.com/{project}")]);
+    validation.set_required_spec_claims(&["exp", "iat", "aud", "iss", "sub"]);
+    decode::<Value>(token, &key, &validation)
+        .map(|data| data.claims)
+        .map_err(|e| format!("{:?}", e.kind()))
 }
 
 fn unix_now() -> u64 {
@@ -322,46 +319,90 @@ async fn explicit_project_times_kid_and_unverified_email() {
     request["ttl"] = json!(900);
     request["kid"] = json!(certs.keys().next().unwrap());
     let token = minted(e.mint(request.clone()).await).await;
-    let claims = verify_at(&token, &certs, "other-project", Some(now)).unwrap();
+    let claims = signed_claims(&token, &certs, "other-project", false).unwrap();
     assert_eq!(claims["iat"], now - 30);
     assert_eq!(claims["exp"], now + 870);
     assert_eq!(claims["auth_time"], now - 30);
     request.as_object_mut().unwrap().remove("ttl");
     request["exp"] = json!(now + 200);
     let token = minted(e.mint(request.clone()).await).await;
-    let claims = verify_at(&token, &certs, "other-project", Some(now)).unwrap();
+    let claims = signed_claims(&token, &certs, "other-project", false).unwrap();
     assert_eq!(claims["iat"], now - 30);
     assert_eq!(claims["exp"], now + 200);
-    verify_at(&token, &certs, "other-project", Some(now + 199)).unwrap();
-    for expired_at in [now + 200, now + 201] {
-        assert_eq!(
-            verify_at(&token, &certs, "other-project", Some(expired_at)).unwrap_err(),
-            "ExpiredSignature"
-        );
-    }
-    request["iat"] = json!(now + 3600);
+    request["iat"] = json!(unix_now() + 3600);
+    request["exp"] = json!(unix_now() + 7200);
     assert_eq!(
-        verify_at(
+        verify(
             &minted(e.mint(request.clone()).await).await,
             &certs,
-            "other-project",
-            Some(now)
+            "other-project"
         )
         .unwrap_err(),
         "iat"
     );
-    request["iat"] = json!(now);
+    request["iat"] = json!(unix_now());
     request["email_verified"] = json!(false);
     assert_eq!(
-        verify_at(
+        verify(
             &minted(e.mint(request).await).await,
             &certs,
-            "other-project",
-            Some(now)
+            "other-project"
         )
         .unwrap_err(),
         "email_verified"
     );
+}
+
+#[tokio::test]
+async fn minted_expiry_preserves_timestamp_and_ttl_limits() {
+    let e = Emulator::new(Some(config())).await;
+    let certs = e.certs().await;
+    for (times, expected_iat, expected_exp) in [
+        (json!({"iat": 1_700_000_000}), 1_700_000_000, 1_700_003_600),
+        (json!({"iat": 0, "ttl": 1}), 0, 1),
+        (
+            json!({"iat": u64::MAX - 1, "ttl": 1}),
+            u64::MAX - 1,
+            u64::MAX,
+        ),
+        (json!({"iat": u64::MAX - 3600}), u64::MAX - 3600, u64::MAX),
+        (json!({"iat": u64::MAX, "exp": 0}), u64::MAX, 0),
+        (json!({"iat": 0, "exp": u64::MAX}), 0, u64::MAX),
+    ] {
+        let mut request = input();
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(times.as_object().unwrap().clone());
+        let token = minted(e.mint(request).await).await;
+        let claims = signed_claims(&token, &certs, PROJECT, false).unwrap();
+        assert_eq!(claims["iat"], expected_iat, "{times}");
+        assert_eq!(claims["auth_time"], expected_iat, "{times}");
+        assert_eq!(claims["exp"], expected_exp, "{times}");
+    }
+    // The largest valid default lifetime is accepted above; one more second
+    // must fail rather than wrap or saturate the minted expiration.
+    let mut request = input();
+    request["iat"] = json!(u64::MAX - 3599);
+    assert_eq!(e.mint(request).await.status(), 400);
+}
+
+#[tokio::test]
+async fn expired_variant_mints_the_documented_past_timestamps() {
+    let e = Emulator::new(Some(config())).await;
+    let certs = e.certs().await;
+    let mut request = input();
+    request["variant"] = json!("expired");
+    let before = unix_now();
+    let token = minted(e.mint(request).await).await;
+    let after = unix_now();
+    let claims = signed_claims(&token, &certs, PROJECT, false).unwrap();
+    let iat = claims["iat"].as_u64().unwrap();
+    let exp = claims["exp"].as_u64().unwrap();
+    assert!((before - 7200..=after - 7200).contains(&iat));
+    assert!((before - 3600..=after - 3600).contains(&exp));
+    assert_eq!(exp - iat, 3600);
+    assert_eq!(claims["auth_time"], iat);
 }
 
 #[tokio::test]
