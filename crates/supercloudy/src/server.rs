@@ -37,7 +37,7 @@ pub use crate::firebase::Config as FirebaseConfig;
 pub use crate::lambda::faults::{Effect as LambdaFaultEffect, Rule as LambdaFaultRule};
 pub use crate::lambda::{Config as LambdaConfig, Target as LambdaTarget};
 pub use crate::openai::faults::{Effect as OpenAiFaultEffect, Rule as OpenAiFaultRule};
-pub use crate::openai::{Config as OpenAiConfig, Fixture};
+pub use crate::openai::{Config as OpenAiConfig, ConversationFixture, Fixture, FunctionCall};
 pub use crate::ssm::{Config as SsmConfig, Parameter, ParameterType};
 
 #[derive(Debug)]

@@ -33,6 +33,7 @@ Every crate inherits the workspace MIT license. Cargo.lock is retained.
 | `fault_config` | AWS fault schema and assembly of service validators |
 | `ssm` | Immutable synthetic parameters, GetParameter validation and JSON 1.1 adapter |
 | `openai` | Immutable Responses fixtures, request validation and HTTP adapter |
+| `openai/streaming` | Buffered Responses SSE event rendering for text, function calls and incomplete responses |
 | `lambda` | Raw Invoke forwarding, bounded task ownership, acceptance and drain/cancel |
 | `lambda/faults` | Invoke fault schema and effects using the shared scheduler |
 | `firebase` | In-memory RSA key/certificate generation, mint validation and HTTP adapter |
@@ -138,19 +139,38 @@ SSM collection is bounded at 64 KiB; overflow is `SerializationException`.
 `up --openai-fixtures <json-file>` enables immutable Responses fixtures. A single
 nonempty bearer is required before body collection; missing, wrong-scheme, empty
 or duplicate authorization returns 401. Tokens are never validated or forwarded.
-Requests require model, input and `text.format` with `type:json_schema`, name and
-an object schema. Input may be a string or nonempty messages with supported roles
+Requests require model and input. Structured requests require `text.format` with
+`type:json_schema`, name and an object schema; conversational requests omit
+`text.format` or use `type:text`. Input may be a string or nonempty messages with supported roles
 and text/content blocks. Text, image and file blocks are accepted; image/file data
-is opaque and never fetched or decoded. Streaming, background execution and tools
-are unsupported. JSON collection is bounded at 32 MiB of actual wire bytes,
+is opaque and never fetched or decoded. Conversational history also accepts
+function calls, function results (string or `input_text` arrays), and opaque
+reasoning/additional-tools items. Tool declarations are accepted only for
+conversational requests and are never executed. Background execution is
+unsupported. JSON collection is bounded at 32 MiB of actual wire bytes,
 including base64 content, with HTTP 413 `request_too_large` on overflow.
 
-Fixtures match exact format name and an optional case-sensitive substring in an
+Structured fixtures match exact format name and an optional case-sensitive substring in an
 individual input text entry; first match wins. Message content strings also count
 as text. Schema strings, image/file fields and serialized JSON are never searched.
 No-match returns HTTP 400 `fixture_not_found`. JSON output is serialized once into
 exactly one assistant message's `output_text` entry in a completed Responses
 envelope. Every stub response, including errors, has a fresh `x-request-id`.
+Conversational fixtures match text in the latest user message or latest function
+result, whichever is newer; earlier history and metadata never participate.
+They emit one literal assistant text or function call. Selector ambiguity and
+invalid function arguments fail at startup. Both fixture lists are optional and
+default to empty. Rust callers adding fields can use `OpenAiConfig::default()`.
+
+Both modes support `stream:true` as buffered `text/event-stream`. Events include
+creation, item/content lifecycle, one text or function-argument delta, and final
+completion. IDs and item content remain consistent throughout each response;
+sequence numbers increase from zero. Incomplete faults produce a final
+`response.incomplete`, while throttle and server faults remain HTTP JSON errors.
+Usage is synthetic zero, not token accounting. No timing, WebSocket Responses,
+compaction or model-discovery simulation is implemented. A separate ignored
+real-Codex compatibility test exercises dynamic-tool dispatch and a resumed thread
+with empty temporary home and a dummy bearer; the ordinary suite needs no Codex.
 No schema execution, consumer parser validation, persistence or outbound network
 operations occur. Synthetic config formats and examples are in the retained
 [SSM and Responses design](plans/ssm-and-openai-stub.md).

@@ -345,7 +345,7 @@ async fn invalid_requests_do_not_consume_faults_and_all_matching_rules_advance()
         json_body(e.post(&invalid).await, 400, "x-request-id").await;
     }
     for (field, value) in [
-        ("stream", json!(true)),
+        ("stream", json!("true")),
         ("background", json!(true)),
         ("tools", json!([{"type":"web_search"}])),
     ] {

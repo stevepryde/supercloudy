@@ -39,9 +39,14 @@ impl Faults {
                 .map(|rule| (rule.first_request, rule.repeat, rule)),
         )))
     }
-    pub(crate) fn response(&self, name: &str, model: &str) -> Option<Response> {
+    pub(crate) fn response(
+        &self,
+        name: Option<&str>,
+        model: &str,
+        stream: bool,
+    ) -> Option<Response> {
         self.0
-            .select(|rule| rule.format_name.as_deref().is_none_or(|n| n == name))
+            .select(|rule| rule.format_name.as_deref().is_none_or(|n| Some(n) == name))
             .map(|rule| match rule.effect {
                 Effect::Throttle => error(
                     StatusCode::TOO_MANY_REQUESTS,
@@ -55,7 +60,7 @@ impl Faults {
                     "internal_server_error",
                     "Injected server error",
                 ),
-                Effect::Incomplete => envelope(model, None),
+                Effect::Incomplete => envelope(model, None, stream),
             })
     }
 }

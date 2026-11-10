@@ -183,8 +183,9 @@ curl -i http://127.0.0.1:8000/v1/responses \
 ```
 
 One nonempty bearer is required; missing, empty or duplicate headers return 401.
-The stub never validates or forwards tokens. Streaming, background mode and tools
-are unsupported. SSM bodies are limited to 64 KiB; Responses JSON to 32 MiB,
+The stub never validates or forwards tokens. `stream: true` returns Responses SSE;
+background mode is unsupported. Structured fixtures do not accept tools; the
+conversational fixtures below support canned function calls. SSM bodies are limited to 64 KiB; Responses JSON to 32 MiB,
 including base64 content. Invalid config fails before binding without logging values.
 Omitting `--ssm-parameters` gives an empty store; omitting `--openai-fixtures`
 disables the reservation. An empty fixture list enables it with no matches.
@@ -203,6 +204,93 @@ Effects are `throttle` (429), `internal_server_error` (500), and `incomplete`
 requests passing auth, size, validation and fixture lookup advance counters.
 Library callers use `server::router_with_services(Config, ServiceConfig)`;
 existing router functions and Config literals retain their defaults.
+
+### Local Codex and conversational SSE
+
+The same endpoint supports deterministic text and function-call fixtures, including
+real `codex app-server` clients. No model or account is needed:
+
+```sh
+cargo run -- up --port 8000 \
+  --openai-fixtures crates/supercloudy/examples/codex-fixtures.json
+```
+
+The additive `conversation_fixtures` list is used when `text.format` is absent or
+`{"type":"text"}`. It may coexist with structured `fixtures`:
+
+```json
+{
+  "conversation_fixtures": [
+    {"input_contains":"Calculate six times seven","function_call":{"name":"calculator","arguments":"{\"left\":6,\"right\":7}"}},
+    {"function_output_contains":"42","output_text":"The result is 42."},
+    {"input_contains":"Say hello","output_text":"Hello from the local fixture."}
+  ]
+}
+```
+
+Each fixture has exactly one output: `output_text` or `function_call`, whose
+`arguments` is a JSON-object string. It may have at most one selector:
+
+- `input_contains` searches text blocks in the most recent user message.
+- `function_output_contains` searches the most recent function result, provided
+  no newer user message exists. String outputs and `input_text` arrays work.
+- Neither selector means a fallback for user input, not for function results.
+
+First matching fixture wins. Earlier turns, assistant messages, instructions,
+tool definitions, and opaque image/file fields cannot select a conversational
+fixture. This prevents a completed call from replaying when its result is sent,
+and allows the same prompt to make a fresh call after a thread is resumed.
+`reasoning` and `additional_tools` history items are accepted as opaque metadata.
+Tool declarations are accepted but not executed or checked against fixture names.
+Your app-server client must register and answer any configured dynamic tools.
+
+For a CLI text-only smoke, use an isolated home and a synthetic provider:
+
+```sh
+local_home=$(mktemp -d)
+mkdir -p "$local_home/codex" "$local_home/workspace"
+env -i PATH="$PATH" HOME="$local_home" CODEX_HOME="$local_home/codex" \
+  SUPERCLOUDY_API_KEY=test codex exec --skip-git-repo-check --ephemeral \
+  -C "$local_home/workspace" -s read-only \
+  -c 'model="synthetic-model"' \
+  -c 'model_provider="supercloudy"' \
+  -c 'model_providers.supercloudy.name="supercloudy"' \
+  -c 'model_providers.supercloudy.base_url="http://127.0.0.1:8000/v1"' \
+  -c 'model_providers.supercloudy.wire_api="responses"' \
+  -c 'model_providers.supercloudy.env_key="SUPERCLOUDY_API_KEY"' \
+  -c 'model_providers.supercloudy.requires_openai_auth=false' \
+  -c 'cli_auth_credentials_store="file"' \
+  -c 'analytics.enabled=false' \
+  'Say hello'
+```
+
+Expected final text: `Hello from the local fixture.` The temporary directory is
+safe to remove when finished. Use the same provider settings with `codex
+app-server --listen stdio://` for app-server integrations. Only the loopback
+`/v1/responses` HTTP endpoint is implemented; WebSocket transport, compaction,
+model discovery and hosted tools are not emulated.
+
+SSE includes response creation, item/content start and completion, text or
+function-argument deltas, and a final `response.completed` (or injected
+`response.incomplete`). Events are buffered, with no timing/tokenization
+simulation; usage counts are synthetic zeros. The `incomplete` fault preserves
+SSE transport. Throttle/server faults return ordinary HTTP 429/500 JSON errors.
+Faults without `format_name` apply to both structured and conversational fixtures;
+named faults apply only to the corresponding structured format.
+
+Run the optional real-binary compatibility test separately from the ordinary
+Rust suite. It starts its own loopback emulator, clears inherited environment,
+creates a temporary empty home, executes a calculator tool, then restarts
+app-server and resumes the thread for another tool round trip:
+
+```sh
+cargo test --test codex_app_server -- --ignored --nocapture
+# Or choose an installed binary explicitly:
+CODEX_BIN=/path/to/codex cargo test --test codex_app_server -- --ignored --nocapture
+```
+
+Verified with `codex-cli 0.163.0`. The optional test is ignored by default because
+the normal suite must not require Codex. It does not install or download Codex.
 
 ## Local Firebase ID tokens
 

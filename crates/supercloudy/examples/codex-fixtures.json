@@ -1,0 +1,19 @@
+{
+  "conversation_fixtures": [
+    {
+      "input_contains": "Calculate six times seven",
+      "function_call": {
+        "name": "calculator",
+        "arguments": "{\"left\":6,\"right\":7}"
+      }
+    },
+    {
+      "function_output_contains": "42",
+      "output_text": "The result is 42."
+    },
+    {
+      "input_contains": "Say hello",
+      "output_text": "Hello from the local fixture."
+    }
+  ]
+}
