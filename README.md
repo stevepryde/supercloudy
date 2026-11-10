@@ -1,7 +1,7 @@
 # supercloudy
 
-An in-memory DynamoDB, S3, SSM and Lambda Invoke emulator with local OpenAI Responses and Firebase ID token stubs.
-Use ordinary AWS SDKs and HTTP clients against one loopback endpoint. No cloud
+An in-memory DynamoDB, S3, SSM, Lambda Invoke, MongoDB and Qdrant emulator with local OpenAI Responses and Firebase ID token stubs.
+Use ordinary SDKs and HTTP clients against loopback endpoints. No cloud
 account is needed. Lambda Invoke can forward to explicitly configured loopback HTTP targets; other services make no outbound network calls.
 
 ```sh
@@ -457,6 +457,66 @@ for repeatable fault scenarios. Library callers can use
 `server::router_with_faults(server::FaultConfig)`; `server::router()` has no faults.
 
 See [the architecture contract](docs/ARCHITECTURE.md) for behavior and boundaries.
+
+## MongoDB and Qdrant
+
+Enable either database independently, alongside the existing HTTP services:
+
+```sh
+supercloudy up --port 8000 --mongodb-port 27017 --qdrant-port 6333
+```
+
+MongoDB clients connect to `mongodb://127.0.0.1:27017/?directConnection=true`.
+Qdrant HTTP clients use `http://127.0.0.1:6333`. No real credentials are needed.
+Each database has its own listener and in-memory state; Qdrant paths do not
+interfere with S3 paths. Use port `0` to allocate a free port. Startup prints all
+enabled addresses only after their listeners bind successfully. Ctrl-C or SIGTERM
+stops the process and discards its data.
+
+Rust tests can start an isolated service directly without a subprocess:
+
+```rust,no_run
+# async fn example() -> std::io::Result<()> {
+let mongo = supercloudy::mongodb::start(0).await?;
+let mongo_uri = format!("mongodb://{}/?directConnection=true", mongo.address());
+let qdrant = supercloudy::qdrant::start(0).await?;
+let qdrant_url = format!("http://{}", qdrant.address());
+// Configure ordinary database clients with these endpoints.
+mongo.shutdown().await?;
+qdrant.shutdown().await?;
+# Ok(())
+# }
+```
+
+Keep the server handle alive for the fixture lifetime. Dropping it cancels the
+owned server. Services do not share state between instances. The supported
+operations and deliberate differences from production servers are documented in
+[the database compatibility contract](docs/plans/database-emulators.md) and
+[the architecture reference](docs/ARCHITECTURE.md#database-services).
+
+### Real-server conformance
+
+Ordinary `cargo test` needs no Docker. Explicit conformance targets use
+Testcontainers to run synthetic scenarios against both Supercloudy and pinned
+real servers:
+
+```sh
+cargo test --locked --test mongodb_conformance -- --ignored
+cargo test --locked --test qdrant_conformance -- --ignored
+```
+
+These commands require Docker and permission to pull the pinned images. Missing
+Docker or failed server startup fails the run. Tests own and clean up their
+containers; there are no cloud accounts or shared production databases. CI runs
+these targets on pull requests, main pushes, version tags, and scheduled/manual
+runs, separately from the Docker-free default suite.
+
+MongoDB uses `mongo:8.0.28` as a single-node replica set, with its TTL monitor
+interval shortened to one second for the expiration scenario. Qdrant uses
+`qdrant/qdrant:v1.18.3-unprivileged`. Compatibility is measured against those
+versions. Passing conformance covers the exercised API contract; it does not
+establish parity for distributed operation, durability, approximate search,
+performance, or unimplemented APIs.
 
 ## Development
 

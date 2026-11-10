@@ -952,7 +952,10 @@ async fn batch_response_and_wire_limits_return_retryable_work_or_validation() {
             .await
             .unwrap_err();
         assert_eq!(
-            error.as_service_error().unwrap().code(),
+            error
+                .as_service_error()
+                .unwrap_or_else(|| panic!("expected modeled service error: {error:?}"))
+                .code(),
             Some("ValidationException")
         );
         assert!(

@@ -1,6 +1,6 @@
 # supercloudy architecture
 
-Status: in-memory DynamoDB, S3, SSM GetParameter, Lambda Invoke, local Responses fixtures and Firebase ID token issuer.
+Status: in-memory DynamoDB, S3, SSM GetParameter, Lambda Invoke, MongoDB, Qdrant, local Responses fixtures and Firebase ID token issuer.
 
 ## Scope
 
@@ -8,6 +8,8 @@ supercloudy is an independent Rust process serving subsets of DynamoDB's JSON
 wire protocol, S3's REST/XML protocol, SSM's JSON 1.1 protocol, Lambda's REST Invoke API and a generic
 OpenAI Responses stub and Firebase ID token issuer on one listener. Consumers use ordinary AWS SDKs or HTTP
 clients against a local endpoint.
+MongoDB's binary protocol and Qdrant's HTTP API use separate optional loopback
+listeners, independently enabled with `--mongodb-port` and `--qdrant-port`.
 There are no consumer dependencies, persistent storage, cloud calls, or cloud
 credentials. Only explicitly configured Lambda targets make loopback HTTP calls. Fixtures and examples are synthetic; dummy credentials are `test`.
 
@@ -25,6 +27,8 @@ Every crate inherits the workspace MIT license. Cargo.lock is retained.
 | --- | --- |
 | `main` | CLI, loopback listener, Ctrl-C shutdown |
 | `server` | Validated configuration, isolated service construction, request entry point |
+| `mongodb` | BSON wire protocol, sessions, cursors, index constraints and transactional storage |
+| `qdrant` | Collection/point HTTP API, payload filtering, exact vector search and BM25 |
 | `routing` | Target/signing-scope/REST precedence before body consumption |
 | `s3` | Atomic in-memory bucket/object operations, ranges, checksums, listing |
 | `s3/http` | URI/header decoding, presign expiry, bounded aws-chunked payload decoding |
@@ -57,6 +61,108 @@ BigDecimal, quick-xml, time/httpdate, percent-encoding, and checksum algorithms.
 reqwest is an HTTP-only runtime dependency for loopback Invoke forwarding. AWS SDKs are dev dependencies.
 `dynamodb/reserved.txt` contains DynamoDB's public
 [reserved word list](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ReservedWords.html).
+
+## Database services
+
+The [database contract](plans/database-emulators.md) defines lifecycle and
+conformance requirements. Each `mongodb::start(port)` or `qdrant::start(port)`
+returns an owning `Server` with `address()` and async `shutdown()`. Port zero
+allocates a free IPv4 loopback port. Instances share no data. The CLI may run
+either or both alongside the existing HTTP services. Database listeners do not
+participate in the HTTP service router and make no outbound calls.
+
+### MongoDB
+
+MongoDB uses native BSON and OP_MSG, with legacy OP_QUERY handshake support for
+clients that need it. A single-node replica-set view enables normal driver
+sessions and transactions without simulating distributed replication. Tests use
+the official Rust driver 3.10 and a real `mongo:8.0.28` replica set.
+
+The command surface includes insert, find, getMore, killCursors, update, delete,
+findAndModify, count, distinct, aggregate, collection/database listing and
+creation/deletion, and create/list/drop indexes. CRUD supports filtering,
+projection, sorting, limits, upserts, ordered/unordered batches, and atomic
+single-document changes. BSON numeric types, null versus missing fields, nested
+documents and arrays are preserved through the protocol.
+
+Queries support comparisons, membership, existence/type checks, logical
+operators, array predicates, regex and `$expr`. Update modifiers include `$set`,
+`$unset`, `$inc`, `$mul`, `$min`, `$max`, `$setOnInsert`, `$push`, `$addToSet`,
+`$pull`, `$pullAll`, `$pop`, `$rename` and date-valued `$currentDate`. Pipeline
+updates evaluate each stage against that stage's input. Aggregation includes
+matching, projection, sorting, limit/skip, grouping, unwind, lookup with variables
+and a subpipeline, union, counting, field changes and root replacement.
+Expressions cover arithmetic/comparisons, conditionals, array/object transforms,
+variables and the documented date conversions; unsupported operators fail.
+
+Unique, compound, sparse and partial indexes enforce constraints on writes and
+index creation. Compound multikey indexes support one array-valued path;
+parallel array paths are rejected. TTL indexes retain their metadata and expire eligible BSON dates
+when commands arrive; there is no background TTL monitor. TTL scheduling is a
+deliberate difference from the real server. Indexes do not simulate query planning
+or performance. Hints must refer to an existing supported index.
+
+Transactions stage writes against an isolated snapshot, retain repeatable reads,
+detect conflicts, and publish successful multi-document commits atomically.
+Abort or a failed transactional write discards staged changes. Retryable writes
+retain per-statement outcomes within the service lifetime. Older transaction
+numbers are rejected. Cursors are session-owned, bounded by batch count and
+response bytes, and release transaction results when the transaction ends.
+Ordinary query cursors materialize results at command execution; concurrent scan
+yielding is not simulated. Storage and session state disappear at shutdown.
+
+Authentication, TLS, compression, checksummed frames, sharding, elections, change streams, durable
+write concerns, physical query plans, views and unimplemented commands/options
+are outside this service. Regex uses Rust's regex engine; unsupported PCRE
+constructs fail. Date conversions support UTC and numeric timezone offsets;
+named timezone databases are not emulated. No real identity or replication is
+implied by driver capability metadata.
+Array updates support explicit numeric positions; positional `$`, `$[]` and
+`$[identifier]` paths are rejected. Find projection `$slice`/`$elemMatch` forms are
+not implemented.
+
+### Qdrant
+
+Qdrant uses the REST API on a dedicated Axum listener. Collection creation,
+inspection, listing, existence/deletion and supported metadata updates are
+implemented. Point operations cover upsert, retrieval by IDs, deletion by IDs or
+filter, count, scroll, query and batch query. Payload indexes retain keyword,
+integer, float, boolean, UUID and datetime metadata, including tenant indexes.
+
+Named/default dense vectors use exact Cosine or Dot search. Cosine vectors are
+normalized on insertion and query. Sparse vectors use dot products, optionally
+weighted by IDF. Filters implement supported match/range conditions and logical
+clauses, with payload/vector selectors applied to returned points. Writes are
+immediately visible, including requests without `wait=true`; asynchronous
+indexing and replication ordering are not simulated.
+
+Local `qdrant/bm25` text inference follows the pinned server's token IDs,
+document/query weighting, English stopwords and Snowball stemming. The
+`qdrant-rust-stemmers` dependency is the upstream fork. Default inference, sparse
+statistics and returned search scores are compared with
+`qdrant/qdrant:v1.18.3-unprivileged`. Mutable sparse index statistics retain
+tombstones after deletion, as that server does before optimization. Supercloudy
+does not run an optimizer, so it does not model later compaction effects.
+
+gRPC, approximate HNSW search, distributed storage, durability, quantization,
+external inference and physical optimizer settings are excluded. Unsupported
+vector distances, query forms and inference options fail explicitly. BM25's
+supported preprocessing is documented by its accepted options; multilingual
+tokenization, ASCII folding and non-English stopword dictionaries are excluded.
+Collection metadata describes the supported API shape, not physical indexes.
+
+### Database validation
+
+Docker-free tests exercise actual loopback sockets using the MongoDB driver and
+HTTP clients. Separate ignored `mongodb_conformance` and `qdrant_conformance`
+targets start pinned Testcontainers and execute the same synthetic scenarios on
+both implementations. MongoDB comparisons preserve stored BSON types and verify
+write failures, rollback, concurrency and query results. Qdrant comparisons
+normalize response timing/version/operation metadata and use explicit tolerance
+for floating-point vectors/scores; logical results and filter membership must
+match. Test helpers live below the integration-test directory so they are not
+compiled as empty standalone test targets. These are development dependencies;
+the emulator runtime needs neither Docker nor either real server.
 
 ## Service routing and S3
 

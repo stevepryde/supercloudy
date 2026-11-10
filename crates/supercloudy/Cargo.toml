@@ -14,6 +14,10 @@ axum.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+bson = "2"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+regex = "1"
+rust-stemmers = { package = "qdrant-rust-stemmers", version = "1.2.2" }
 md-5 = "0.10"
 sha2 = "0.10"
 crc32fast = "1"
@@ -24,9 +28,12 @@ http-body-util = "0.1"
 percent-encoding = "2"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 jsonwebtoken = { version = "10.4", features = ["aws_lc_rs"] }
-reqwest = { version = "0.12", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 
 [dev-dependencies]
+mongodb = { version = "=3.10.0", default-features = false, features = ["compat-3-0-0", "rustls-tls"] }
+testcontainers = "0.27.3"
+testcontainers-modules = { version = "0.15", features = ["mongo"] }
 proptest = { version = "1.11", default-features = false, features = ["std"] }
 # Keep the current HTTPS client without the legacy HTTP/TLS stack enabled by defaults.
 aws-sdk-dynamodb = { version = "1.135.0", default-features = false, features = ["default-https-client", "rt-tokio"] }

@@ -17,6 +17,12 @@ enum Command {
         /// TCP port to listen on (0 selects an available port).
         #[arg(long, default_value_t = 8000)]
         port: u16,
+        /// Enable MongoDB on a separate loopback TCP port (0 selects a free port).
+        #[arg(long)]
+        mongodb_port: Option<u16>,
+        /// Enable Qdrant on a separate loopback HTTP port (0 selects a free port).
+        #[arg(long)]
+        qdrant_port: Option<u16>,
         /// JSON file containing explicit deterministic fault rules.
         #[arg(long)]
         faults: Option<PathBuf>,
@@ -50,6 +56,8 @@ async fn main() -> std::io::Result<()> {
         command:
             Command::Up {
                 port,
+                mongodb_port,
+                qdrant_port,
                 faults,
                 buckets,
                 ssm_parameters,
@@ -92,7 +100,24 @@ async fn main() -> std::io::Result<()> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
     );
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
+    let mongodb = match mongodb_port {
+        Some(port) => Some(supercloudy::mongodb::start(port).await?),
+        None => None,
+    };
+    let qdrant = match qdrant_port {
+        Some(port) => Some(supercloudy::qdrant::start(port).await?),
+        None => None,
+    };
     println!("Listening on http://{}", listener.local_addr()?);
+    if let Some(server) = &mongodb {
+        println!(
+            "MongoDB on mongodb://{}/?directConnection=true",
+            server.address()
+        );
+    }
+    if let Some(server) = &qdrant {
+        println!("Qdrant on http://{}", server.address());
+    }
     let draining = runtime.clone();
     let result = axum::serve(listener, runtime.router())
         .with_graceful_shutdown(async move {
@@ -102,6 +127,12 @@ async fn main() -> std::io::Result<()> {
         })
         .await;
     runtime.shutdown().await;
+    if let Some(server) = mongodb {
+        server.shutdown().await?;
+    }
+    if let Some(server) = qdrant {
+        server.shutdown().await?;
+    }
     result
 }
 
