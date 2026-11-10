@@ -636,7 +636,7 @@ fn create_configuration(bytes: &[u8]) -> Result<()> {
             Event::DocType(_) => return Err(Error::new("MalformedXML", "DTD is unsupported")),
             Event::Text(e) => {
                 let text = e
-                    .xml_content()
+                    .xml11_content()
                     .map_err(|_| Error::new("MalformedXML", "Invalid XML text"))?;
                 if depth < 2 && !text.chars().all(char::is_whitespace) {
                     return Err(Error::new(
@@ -649,7 +649,7 @@ fn create_configuration(bytes: &[u8]) -> Result<()> {
                 if depth != 2 {
                     return Err(Error::new("MalformedXML", "Unexpected CDATA"));
                 }
-                e.xml_content()
+                e.xml11_content()
                     .map_err(|_| Error::new("MalformedXML", "Invalid XML text"))?;
             }
             Event::GeneralRef(e) => {

@@ -9,8 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
-use rsa::{RsaPrivateKey, pkcs1::EncodeRsaPrivateKey, pkcs8::EncodePrivateKey, rand_core::OsRng};
+use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_RSA_SHA256, RsaKeySize};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -105,12 +104,9 @@ impl Service {
         {
             return Err("Invalid Firebase default project_id".into());
         }
-        // rcgen's ring backend imports RSA keys; RSA generation uses the OS RNG.
-        // DER remains in memory; no key/certificate files or debug output exist.
+        // AWS-LC generates and signs with OS randomness. Key material stays in memory.
         let material = (|| -> Result<_, Box<dyn std::error::Error>> {
-            let private = RsaPrivateKey::new(&mut OsRng, 2048)?;
-            let der = private.to_pkcs8_der()?;
-            let pair = KeyPair::try_from(der.as_bytes())?;
+            let pair = KeyPair::generate_rsa_for(&PKCS_RSA_SHA256, RsaKeySize::_2048)?;
             let mut params = CertificateParams::default();
             params.distinguished_name = DistinguishedName::new();
             params
@@ -118,9 +114,7 @@ impl Service {
                 .push(DnType::CommonName, "Synthetic Firebase issuer");
             let cert = params.self_signed(&pair)?;
             let kid = format!("{:x}", Sha256::digest(cert.der()));
-            // The JWT Rust backend consumes PKCS#1, while rcgen imports PKCS#8.
-            let signing_der = private.to_pkcs1_der()?;
-            let key = EncodingKey::from_rsa_der(signing_der.as_bytes());
+            let key = EncodingKey::from_rsa_pem(pair.serialize_pem().as_bytes())?;
             Ok((key, kid, cert.pem()))
         })()
         .map_err(|_| "Unable to generate Firebase signing material".to_owned())?;
