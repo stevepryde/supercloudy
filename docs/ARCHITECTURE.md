@@ -12,6 +12,8 @@ MongoDB's binary protocol and Qdrant's HTTP API use separate optional loopback
 listeners, independently enabled with `--mongodb-port` and `--qdrant-port`.
 There are no consumer dependencies, persistent storage, cloud calls, or cloud
 credentials. Only explicitly configured Lambda targets make loopback HTTP calls. Fixtures and examples are synthetic; dummy credentials are `test`.
+Services are implemented here rather than delegated to AWS Emulator; see
+[D-1](../specs/decisions.md#d-1-keep-custom-emulators-do-not-adopt-aws-emulator-as-a-replacement).
 
 The `supercloudy up --port <u16>` CLI binds `127.0.0.1`, defaults to port 8000,
 prints its actual address, and serves until interrupted. Repeatable `--bucket`
